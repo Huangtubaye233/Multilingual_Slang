@@ -54,13 +54,16 @@ class SlangGenModel:
         
         whole_finetuned_file = data_dir + 'sum_embed_' + params['embed_name'] + '_whole_finetuned.npz'
         with_head_file = data_dir + 'sum_embed_' + params['embed_name'] + '_with_head.npz'
+        distilled_file = data_dir + 'sum_embed_' + params['embed_name'] + '_multilingual_distilled.npz'
         
         if os.path.exists(whole_finetuned_file):
             def_embeds = np.load(whole_finetuned_file)
         elif os.path.exists(with_head_file):
             def_embeds = np.load(with_head_file)
+        elif os.path.exists(distilled_file):
+            def_embeds = np.load(distilled_file)
         else:
-            raise FileNotFoundError(f"Neither {whole_finetuned_file} nor {with_head_file} found")
+            raise FileNotFoundError(f"None of embed files found: {whole_finetuned_file}, {with_head_file}, {distilled_file}")
             
         E = def_embeds['train'].shape[1]
         
@@ -95,13 +98,16 @@ class SlangGenModel:
             # Check which model file exists
             whole_finetuned_file = data_dir + 'sum_embed_' + params['embed_name'] + '_whole_finetuned.npz'
             with_head_file = data_dir + 'sum_embed_' + params['embed_name'] + '_with_head.npz'
+            distilled_file = data_dir + 'sum_embed_' + params['embed_name'] + '_multilingual_distilled.npz'
             
             if os.path.exists(whole_finetuned_file):
                 def_embeds = np.load(whole_finetuned_file)
             elif os.path.exists(with_head_file):
                 def_embeds = np.load(with_head_file)
+            elif os.path.exists(distilled_file):
+                def_embeds = np.load(distilled_file)
             else:
-                raise FileNotFoundError(f"Neither {whole_finetuned_file} nor {with_head_file} found")
+                raise FileNotFoundError(f"None of embed files found: {whole_finetuned_file}, {with_head_file}, {distilled_file}")
         
         E = def_embeds['train'].shape[1]
         
@@ -132,13 +138,16 @@ class SlangGenModel:
         # Check which model file exists
         whole_finetuned_file = data_dir + 'sum_embed_' + params['embed_name'] + '_whole_finetuned.npz'
         with_head_file = data_dir + 'sum_embed_' + params['embed_name'] + '_with_head.npz'
+        distilled_file = data_dir + 'sum_embed_' + params['embed_name'] + '_multilingual_distilled.npz'
         
         if os.path.exists(whole_finetuned_file):
             def_embeds = np.load(whole_finetuned_file)
         elif os.path.exists(with_head_file):
             def_embeds = np.load(with_head_file)
+        elif os.path.exists(distilled_file):
+            def_embeds = np.load(distilled_file)
         else:
-            raise FileNotFoundError(f"Neither {whole_finetuned_file} nor {with_head_file} found")
+            raise FileNotFoundError(f"None of embed files found: {whole_finetuned_file}, {with_head_file}, {distilled_file}")
             
         E = def_embeds['train'].shape[1]
         

@@ -163,8 +163,17 @@ class SBertWithHeadEncoder(SenseEncoder):
                 return self.linear(x)
         
         self.triplet_head = TripletHead(embed_dim, head_dim).to(device)
-        self.sbert_model.load_state_dict(checkpoint['se_model'])
-        self.triplet_head.load_state_dict(checkpoint['triplet_head'])
+
+        # Load weights: support both finetuned schema (se_model/triplet_head)
+        # and distilled schema (student_model/student_head)
+        if 'se_model' in checkpoint and 'triplet_head' in checkpoint:
+            self.sbert_model.load_state_dict(checkpoint['se_model'])
+            self.triplet_head.load_state_dict(checkpoint['triplet_head'])
+        elif 'student_model' in checkpoint and 'student_head' in checkpoint:
+            self.sbert_model.load_state_dict(checkpoint['student_model'])
+            self.triplet_head.load_state_dict(checkpoint['student_head'])
+        else:
+            raise KeyError('Unsupported checkpoint schema: expected (se_model, triplet_head) or (student_model, student_head)')
         self.sbert_model.eval()
         self.triplet_head.eval()
         self.name = head_path.split('/')[-1].replace('.pt','')

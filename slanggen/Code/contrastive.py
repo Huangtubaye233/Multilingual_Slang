@@ -19,6 +19,7 @@ from tqdm import trange
 from .util import *
 from .encoder import SBertWithHeadEncoder
 import os
+import torch.nn.functional as F
 
 class SlangGenTrainer:
     
@@ -97,14 +98,13 @@ class SlangGenTrainer:
         SE_multilingual_path = os.path.join(os.path.dirname(model_name), model_path + '_multilingual_distilled.pt')
         # SE_head_path = model_name + '_with_head.pt'
         
-        # Check for multilingual distilled model first
+        # Check for multilingual distilled model first (now load directly)
         if os.path.exists(SE_multilingual_path):
-            # Load multilingual distilled model using SBertWithHeadEncoder
-            # Determine the base model from the saved checkpoint
+            # Determine the base model from the saved checkpoint metadata
             checkpoint = torch.load(SE_multilingual_path, map_location='cpu')
-            teacher_model_path = checkpoint['teacher_model_path']
+            teacher_model_path = checkpoint.get('teacher_model_path', '')
             teacher_model_name = teacher_model_path.split('/')[-1]
-            
+
             if 'mpnet' in teacher_model_name:
                 base_model_name = 'paraphrase-multilingual-mpnet-base-v2'
             elif 'e5_base' in teacher_model_name:
@@ -116,34 +116,11 @@ class SlangGenTrainer:
             elif 'LaBSE' in teacher_model_name:
                 base_model_name = 'LaBSE'
             else:
+                # default to mpnet if teacher name unavailable
                 base_model_name = 'paraphrase-multilingual-mpnet-base-v2'
-            
-            # Create a temporary path for the multilingual model
-            temp_model_path = SE_multilingual_path.replace('_multilingual_distilled.pt', '_whole_finetuned.pt')
-            
-            # Save the student model and head in the format expected by SBertWithHeadEncoder
-            student_model = SentenceTransformer(base_model_name)
-            student_model.load_state_dict(checkpoint['student_model'])
-            
-            class StudentHead(nn.Module):
-                def __init__(self, input_dim, output_dim):
-                    super().__init__()
-                    self.linear = nn.Linear(input_dim, output_dim)
-                def forward(self, x):
-                    return self.linear(x)
-            
-            student_head = StudentHead(checkpoint['embed_dim'], checkpoint['head_dim'])
-            student_head.load_state_dict(checkpoint['student_head'])
-            
-            # Save in the format expected by SBertWithHeadEncoder
-            torch.save({
-                'se_model': student_model.state_dict(),
-                'triplet_head': student_head.state_dict(),
-                'embed_dim': checkpoint['embed_dim'],
-                'head_dim': checkpoint['head_dim']
-            }, temp_model_path)
-            
-            self.sense_encoder = SBertWithHeadEncoder(base_model_name, temp_model_path)
+
+            # Directly load distilled checkpoint with SBertWithHeadEncoder
+            self.sense_encoder = SBertWithHeadEncoder(base_model_name, SE_multilingual_path)
         elif os.path.exists(SE_whole_path):
             if model_path == 'SBERT_contrastive':
                 self.sense_encoder = SBertWithHeadEncoder('bert-base-nli-mean-tokens', SE_whole_path)
@@ -754,12 +731,14 @@ class SlangGenTrainer:
         """
         if params is None:
             params = {
-                'train_batch_size': 16, 
-                'num_epochs': 10, 
+                'train_batch_size': 32,
+                'num_epochs': 10,
                 'learning_rate': 2e-5,
                 'head_dim': 768,
-                'alpha': 0.5,  # Weight for distillation loss vs MSE loss
-                'outpath': embed_name
+                'alpha': 0.5,  # kept for backward-compat (unused when loss=In_Batch_Neg)
+                'outpath': embed_name,
+                'temperature': 0.07,
+                'loss': 'In_Batch_Neg'  # 'In_Batch_Neg' or 'mse'
             }
 
         # Set up directory structure based on embed_name
@@ -838,6 +817,10 @@ class SlangGenTrainer:
         pairs_df = pd.read_csv(sentence_pairs_csv)
         pairs_df.dropna(subset=['sentence_s', 'sentence_t'], inplace=True)
         pairs_df[['sentence_s', 'sentence_t']] = pairs_df[['sentence_s', 'sentence_t']].astype(str)
+        # Use only the first N samples to speed up experiments
+        max_rows = 1500
+        if len(pairs_df) > max_rows:
+            pairs_df = pairs_df.iloc[:max_rows].reset_index(drop=True)
         
         # Split into train/dev
         train_size = int(0.8 * len(pairs_df))
@@ -889,9 +872,12 @@ class SlangGenTrainer:
         student_model = student_model.to(device)
         student_head = student_head.to(device)
 
-        # Loss functions
+        # Loss setup
         mse_loss_fn = nn.MSELoss()
         alpha = params.get('alpha', 0.5)
+        temperature = params.get('temperature', 0.07)
+        _loss_name = str(params.get('loss', 'In_Batch_Neg')).lower()
+        use_infonce = (_loss_name in ('in_batch_neg', 'infonce'))
 
         # Optimizer
         optimizer = optim.Adam([
@@ -908,6 +894,8 @@ class SlangGenTrainer:
             total_loss = 0
             total_mse_loss = 0
             total_distill_loss = 0
+            total_infonce_src = 0
+            total_infonce_tgt = 0
             
             for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{params['num_epochs']} - Training"):
                 source_sents, target_sents = batch
@@ -919,49 +907,65 @@ class SlangGenTrainer:
                         dtype=torch.float32
                     ).to(device)
                 
-                # Get student embeddings
-                student_source_emb = torch.tensor(
-                    student_model.encode(source_sents, convert_to_numpy=True), 
-                    dtype=torch.float32
-                ).to(device)
-                student_target_emb = torch.tensor(
-                    student_model.encode(target_sents, convert_to_numpy=True), 
-                    dtype=torch.float32
-                ).to(device)
+                # Get student embeddings (train full model via forward pass)
+                src_tokens = student_model.tokenize(list(source_sents))
+                src_tokens = {k: v.to(device) for k, v in src_tokens.items()}
+                tgt_tokens = student_model.tokenize(list(target_sents))
+                tgt_tokens = {k: v.to(device) for k, v in tgt_tokens.items()}
+                student_source_emb = student_model(src_tokens)['sentence_embedding']
+                student_target_emb = student_model(tgt_tokens)['sentence_embedding']
                 
                 # Pass through student head
                 student_source_head = student_head(student_source_emb)
                 student_target_head = student_head(student_target_emb)
-                
+
                 # Normalize embeddings
                 student_source_head = torch.nn.functional.normalize(student_source_head, p=2, dim=1)
                 student_target_head = torch.nn.functional.normalize(student_target_head, p=2, dim=1)
                 teacher_source_emb = torch.nn.functional.normalize(teacher_source_emb, p=2, dim=1)
-                
-                # Compute losses
-                # 1. MSE loss: student should match teacher for source sentences
-                mse_loss = mse_loss_fn(student_source_head, teacher_source_emb)
-                
-                # 2. Distillation loss: student target should match teacher source
-                distill_loss = mse_loss_fn(student_target_head, teacher_source_emb)
-                
-                # Combined loss
-                loss = alpha * mse_loss + (1 - alpha) * distill_loss
+
+                if use_infonce:
+                    # InfoNCE with in-batch negatives
+                    bsz = teacher_source_emb.size(0)
+                    labels = torch.arange(bsz, device=device)
+                    # student EN vs teacher EN
+                    logits_src = (student_source_head @ teacher_source_emb.t()) / temperature
+                    loss_src = F.cross_entropy(logits_src, labels)
+                    # student ZH vs teacher EN
+                    logits_tgt = (student_target_head @ teacher_source_emb.t()) / temperature
+                    loss_tgt = F.cross_entropy(logits_tgt, labels)
+                    loss = (loss_src + loss_tgt) * 0.5
+                else:
+                    # Original MSE-based losses
+                    mse_loss = mse_loss_fn(student_source_head, teacher_source_emb)
+                    distill_loss = mse_loss_fn(student_target_head, teacher_source_emb)
+                    loss = alpha * mse_loss + (1 - alpha) * distill_loss
                 
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
                 
                 total_loss += loss.item()
-                total_mse_loss += mse_loss.item()
-                total_distill_loss += distill_loss.item()
+                if use_infonce:
+                    total_infonce_src += float(loss_src.item())
+                    total_infonce_tgt += float(loss_tgt.item())
+                else:
+                    total_mse_loss += mse_loss.item()
+                    total_distill_loss += distill_loss.item()
             
             avg_train_loss = total_loss / len(train_loader)
             avg_mse_loss = total_mse_loss / len(train_loader)
             avg_distill_loss = total_distill_loss / len(train_loader)
             
-            print(f"Epoch {epoch+1} - Train Loss: {avg_train_loss:.4f} "
-                  f"(MSE: {avg_mse_loss:.4f}, Distill: {avg_distill_loss:.4f})")
+            if use_infonce:
+                avg_src = total_infonce_src / max(1, len(train_loader))
+                avg_tgt = total_infonce_tgt / max(1, len(train_loader))
+                print(f"Epoch {epoch+1} - Train Loss: {avg_train_loss:.4f} (In_Batch_Neg-src: {avg_src:.4f}, In_Batch_Neg-tgt: {avg_tgt:.4f})")
+            else:
+                avg_mse_loss = total_mse_loss / max(1, len(train_loader))
+                avg_distill_loss = total_distill_loss / max(1, len(train_loader))
+                print(f"Epoch {epoch+1} - Train Loss: {avg_train_loss:.4f} "
+                      f"(MSE: {avg_mse_loss:.4f}, Distill: {avg_distill_loss:.4f})")
 
             # Validation phase
             student_model.eval()
@@ -969,6 +973,8 @@ class SlangGenTrainer:
             val_loss = 0
             val_mse_loss = 0
             val_distill_loss = 0
+            val_infonce_src = 0
+            val_infonce_tgt = 0
             
             with torch.no_grad():
                 for batch in tqdm(dev_loader, desc=f"Epoch {epoch+1}/{params['num_epochs']} - Validation"):
@@ -979,37 +985,50 @@ class SlangGenTrainer:
                         dtype=torch.float32
                     ).to(device)
                     
-                    student_source_emb = torch.tensor(
-                        student_model.encode(source_sents, convert_to_numpy=True), 
-                        dtype=torch.float32
-                    ).to(device)
-                    student_target_emb = torch.tensor(
-                        student_model.encode(target_sents, convert_to_numpy=True), 
-                        dtype=torch.float32
-                    ).to(device)
+                    src_tokens = student_model.tokenize(list(source_sents))
+                    src_tokens = {k: v.to(device) for k, v in src_tokens.items()}
+                    tgt_tokens = student_model.tokenize(list(target_sents))
+                    tgt_tokens = {k: v.to(device) for k, v in tgt_tokens.items()}
+                    student_source_emb = student_model(src_tokens)['sentence_embedding']
+                    student_target_emb = student_model(tgt_tokens)['sentence_embedding']
                     
                     student_source_head = student_head(student_source_emb)
                     student_target_head = student_head(student_target_emb)
-                    
+
                     # Normalize embeddings
                     student_source_head = torch.nn.functional.normalize(student_source_head, p=2, dim=1)
                     student_target_head = torch.nn.functional.normalize(student_target_head, p=2, dim=1)
                     teacher_source_emb = torch.nn.functional.normalize(teacher_source_emb, p=2, dim=1)
-                    
-                    mse_loss = mse_loss_fn(student_source_head, teacher_source_emb)
-                    distill_loss = mse_loss_fn(student_target_head, teacher_source_emb)
-                    loss = alpha * mse_loss + (1 - alpha) * distill_loss
-                    
+
+                    if use_infonce:
+                        bsz = teacher_source_emb.size(0)
+                        labels = torch.arange(bsz, device=device)
+                        logits_src = (student_source_head @ teacher_source_emb.t()) / temperature
+                        loss_src = F.cross_entropy(logits_src, labels)
+                        logits_tgt = (student_target_head @ teacher_source_emb.t()) / temperature
+                        loss_tgt = F.cross_entropy(logits_tgt, labels)
+                        loss = (loss_src + loss_tgt) * 0.5
+                        val_infonce_src += float(loss_src.item())
+                        val_infonce_tgt += float(loss_tgt.item())
+                    else:
+                        mse_loss = mse_loss_fn(student_source_head, teacher_source_emb)
+                        distill_loss = mse_loss_fn(student_target_head, teacher_source_emb)
+                        loss = alpha * mse_loss + (1 - alpha) * distill_loss
+                        val_mse_loss += mse_loss.item()
+                        val_distill_loss += distill_loss.item()
+
                     val_loss += loss.item()
-                    val_mse_loss += mse_loss.item()
-                    val_distill_loss += distill_loss.item()
             
             avg_val_loss = val_loss / len(dev_loader)
-            avg_val_mse_loss = val_mse_loss / len(dev_loader)
-            avg_val_distill_loss = val_distill_loss / len(dev_loader)
-            
-            print(f"Epoch {epoch+1} - Val Loss: {avg_val_loss:.4f} "
-                  f"(MSE: {avg_val_mse_loss:.4f}, Distill: {avg_val_distill_loss:.4f})")
+            if use_infonce:
+                avg_val_src = val_infonce_src / max(1, len(dev_loader))
+                avg_val_tgt = val_infonce_tgt / max(1, len(dev_loader))
+                print(f"Epoch {epoch+1} - Val Loss: {avg_val_loss:.4f} (In_Batch_Neg-src: {avg_val_src:.4f}, In_Batch_Neg-tgt: {avg_val_tgt:.4f})")
+            else:
+                avg_val_mse_loss = val_mse_loss / max(1, len(dev_loader))
+                avg_val_distill_loss = val_distill_loss / max(1, len(dev_loader))
+                print(f"Epoch {epoch+1} - Val Loss: {avg_val_loss:.4f} "
+                      f"(MSE: {avg_val_mse_loss:.4f}, Distill: {avg_val_distill_loss:.4f})")
 
             # Save best model
             if avg_val_loss < best_val_loss:
@@ -1022,7 +1041,9 @@ class SlangGenTrainer:
                     'val_loss': best_val_loss,
                     'alpha': alpha,
                     'learning_rate': params['learning_rate'],
-                    'teacher_model_path': teacher_model_path
+                    'teacher_model_path': teacher_model_path,
+                    'temperature': temperature,
+                    'loss': ('In_Batch_Neg' if use_infonce else 'mse')
                 }
                 torch.save(save_dict, output_path + '_multilingual_distilled.pt')
                 print(f"New best model saved with validation loss: {best_val_loss:.4f}")
