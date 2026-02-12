@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.pyo
+
+# LLM_Eval artifacts
+LLM_Eval/__pycache__/
+LLM_Eval/logs/
+LLM_Eval/output/
