@@ -6,7 +6,6 @@ Run GPT generation-style multiple-choice evaluation for slang definitions.
 from __future__ import annotations
 
 import argparse
-import json
 import random
 import time
 from pathlib import Path
@@ -16,48 +15,115 @@ import pandas as pd
 from openai import OpenAI
 from tqdm import tqdm
 
+from run_gpt_detection import (  # type: ignore
+    load_api_key_from_file,
+    parse_json_response,
+    sanitize_model_name,
+)
+
+
+PROMPT_LANG_CHOICES = ("en", "zh")
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "Generation"
 RESULTS_DIR = BASE_DIR / "Results"
 CSV_ENCODING = "utf-8-sig"
 
+OPENAI_API_KEY = ""
+
 LANG_TO_DATASET = {
-    "en": DATA_DIR / "en_generation.csv",
+    "en": DATA_DIR / "en_generation_OD.csv",
     "ru": DATA_DIR / "ru_generation.csv",
     "zh": DATA_DIR / "zh_generation.csv",
 }
 
-TASK_CHOICES = ["def_only", "context", "both"]
+DEF_SYSTEM_PROMPTS = {
+    "en": (
+        "You are a sociolinguist who answers multiple-choice questions about slang definitions. "
+        "IMPORTANT: ONLY RESPOND WITH COMPACT JSON FOLLOWING THIS SCHEMA: "
+        '{"choice":"A|B|C|D","rationale":"string"}. '
+        "Choose the option that matches the definition and keep the rationale short."
+    ),
+    "zh": (
+        "你是一名社会语言学家，需要回答关于俚语定义的多选题。"
+        "只能使用如下 JSON 模板作答："
+        '{"choice":"A|B|C|D","rationale":"字符串"}。'
+        "请选择最符合定义的选项，理由保持简洁，不要添加其他文字。"
+    ),
+}
 
-DEF_SYSTEM_PROMPT = (
-    "You are a sociolinguist who answers multiple-choice questions about slang definitions. "
-    "Only respond with compact JSON following this schema: "
-    '{"choice":"A|B|C|D","rationale":"string"}. '
-    "Choose the option that matches the definition and keep the rationale short."
-)
+CONTEXT_SYSTEM_PROMPTS = {
+    "en": (
+        "You are a sociolinguist who answers multiple-choice questions about slang definitions "
+        "using both a definition and an example sentence. Only respond with compact JSON following "
+        "this schema: "
+        '{"choice":"A|B|C|D","rationale":"string"}. '
+        "Choose the option that best fits the provided context."
+    ),
+    "zh": (
+        "你是一名社会语言学家，需要同时依据俚语定义和示例句回答多选题。"
+        "只能使用如下 JSON 模板作答："
+        '{"choice":"A|B|C|D","rationale":"字符串"}。'
+        "请选择最符合给定语境的选项。"
+    ),
+}
 
-CONTEXT_SYSTEM_PROMPT = (
-    "You are a sociolinguist who answers multiple-choice questions about slang definitions "
-    "using both a definition and an example sentence. Only respond with compact JSON following "
-    "this schema: "
-    '{"choice":"A|B|C|D","rationale":"string"}. '
-    "Choose the option that best fits the provided context."
-)
+
+class GPTDetector:
+    def __init__(
+        self,
+        model_id: str,
+        api_key_file: Path,
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+    ) -> None:
+        api_key = OPENAI_API_KEY.strip() or load_api_key_from_file(api_key_file)
+        self.client = OpenAI(api_key=api_key)
+        self.model_id = model_id
+        self.max_new_tokens = max_new_tokens
+        self.temperature = temperature
+        self.top_p = top_p
+
+    def generate(self, system_prompt: str, user_prompt: str) -> str:
+        last_error: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model_id,
+                    temperature=self.temperature,
+                    top_p=self.top_p,
+                    max_tokens=self.max_new_tokens,
+                    response_format={"type": "json_object"},
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                )
+                content = response.choices[0].message.content
+                return content or ""
+            except Exception as exc:  # pylint: disable=broad-except
+                last_error = exc
+                time.sleep(2**attempt)
+        raise RuntimeError("OpenAI API call failed after 3 attempts") from last_error
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run GPT-based slang generation evaluation.")
+    parser = argparse.ArgumentParser(description="Run GPT slang generation evaluation.")
     parser.add_argument(
-        "--task",
-        choices=TASK_CHOICES,
-        default="both",
-        help="Which generation task(s) to run.",
+        "--mode",
+        choices=["multi", "mono", "multi_legacy"],
+        default="mono",
+        help=(
+            "multi: language-specific conv_def + sentence_with_blank, options are slang_definition; "
+            "mono: conv_def_en + sentence_with_blank_en (en uses conv_def/sentence_with_blank), options are slang_definition_en; "
+            "multi_legacy: original pipeline using slang_definition + sentence_with_blank with slang/distractor options."
+        ),
     )
     parser.add_argument(
-        "--model",
+        "--model-id",
         default="gpt-4o-mini",
-        help="OpenAI model name to query.",
+        help="OpenAI model ID to query.",
     )
     parser.add_argument(
         "--output-dir",
@@ -72,81 +138,63 @@ def parse_args() -> argparse.Namespace:
         help="Path to a text file that stores the OpenAI API key.",
     )
     parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=2048,
+        help="Maximum tokens to generate per request.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0,
+        help="Sampling temperature; set 0 for deterministic decoding.",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=0.95,
+        help="Top-p (nucleus) sampling threshold.",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
         help="Base seed for shuffling answer options.",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug mode (sample a few rows per language).",
+    )
+    parser.add_argument(
+        "--debug-samples",
+        type=int,
+        default=5,
+        help="Rows per language when --debug is set.",
+    )
+    parser.add_argument(
+        "--prompt-language",
+        choices=PROMPT_LANG_CHOICES,
+        default="en",
+        help="Language used for system/user prompts.",
+    )
+    parser.add_argument(
+        "--icl-shots",
+        type=int,
+        default=0,
+        help="Number of ICL shots inserted into the prompt.",
+    )
+    parser.add_argument(
+        "--chime",
+        action="store_true",
+        help="Only run zh on chime dataset (zh_generation_chime.csv, zh_generation_chime_icl.csv); output suffix _chime.",
+    )
+    parser.add_argument(
+        "--od",
+        action="store_true",
+        help="Run OD-only English evaluation (lang=en only) using OD English datasets; output suffix _OD_only.",
+    )
     return parser.parse_args()
-
-
-def load_api_key_from_file(path: Path) -> str:
-    if not path.exists():
-        raise FileNotFoundError(f"API key file not found: {path}")
-    api_key = path.read_text(encoding="utf-8").strip()
-    if not api_key:
-        raise ValueError(f"API key file {path} is empty.")
-    return api_key
-
-
-def load_dataset(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    return df
-
-
-def clean_model_json(text: str) -> str:
-    content = text.strip()
-    if content.startswith("```"):
-        parts = content.split("```")
-        for part in parts:
-            candidate = part.strip()
-            if not candidate:
-                continue
-            if candidate.lower().startswith("json"):
-                candidate = candidate[4:].strip()
-            if candidate:
-                return candidate
-        return content
-    return content
-
-
-def parse_json_response(raw: str) -> Tuple[Optional[Dict[str, Any]], str]:
-    cleaned = clean_model_json(raw)
-    try:
-        parsed = json.loads(cleaned)
-        return parsed, json.dumps(parsed, ensure_ascii=False)
-    except json.JSONDecodeError:
-        return None, cleaned
-
-
-def call_openai_with_retry(
-    client: OpenAI,
-    model: str,
-    system_prompt: str,
-    user_prompt: str,
-) -> str:
-    last_error: Optional[Exception] = None
-    for attempt in range(3):
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                temperature=0.3,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-            )
-            return response.choices[0].message.content
-        except Exception as exc:
-            last_error = exc
-            sleep_for = 2 ** attempt
-            time.sleep(sleep_for)
-    raise RuntimeError("OpenAI API call failed after 3 attempts") from last_error
-
-
-def sanitize_model_name(model_name: str) -> str:
-    return model_name.replace("/", "_").replace(":", "_")
 
 
 def deterministic_rng(seed: int, language: str, row_idx: int) -> random.Random:
@@ -156,15 +204,54 @@ def deterministic_rng(seed: int, language: str, row_idx: int) -> random.Random:
     return rng
 
 
-def prepare_options(record: pd.Series, rng: random.Random) -> Tuple[Dict[str, str], str]:
-    candidates = [
-        {"text": str(record.get("slang", "")).strip(), "is_correct": True},
-        {"text": str(record.get("distractor_1", "")).strip(), "is_correct": False},
-        {"text": str(record.get("distractor_2", "")).strip(), "is_correct": False},
-        {"text": str(record.get("distractor_3", "")).strip(), "is_correct": False},
-    ]
+def prepare_options(
+    record: pd.Series,
+    rng: random.Random,
+    mode: str,
+    language: str,
+) -> Tuple[Dict[str, str], str]:
+    def pick(field: str) -> str:
+        return str(record.get(field, "") or "").strip()
+
+    if mode == "multi_legacy":
+        candidates = [
+            {"text": pick("slang"), "is_correct": True},
+            {"text": pick("distractor_1"), "is_correct": False},
+            {"text": pick("distractor_2"), "is_correct": False},
+            {"text": pick("distractor_3"), "is_correct": False},
+        ]
+    elif mode == "mono":
+        gold = pick("slang_definition" if language == "en" else "slang_definition_en")
+        d1 = pick(
+            "distractor_1_slang_def" if language == "en" else "distractor_1_slang_def_en"
+        )
+        d2 = pick(
+            "distractor_2_slang_def" if language == "en" else "distractor_2_slang_def_en"
+        )
+        d3 = pick(
+            "distractor_3_slang_def" if language == "en" else "distractor_3_slang_def_en"
+        )
+        candidates = [
+            {"text": gold, "is_correct": True},
+            {"text": d1, "is_correct": False},
+            {"text": d2, "is_correct": False},
+            {"text": d3, "is_correct": False},
+        ]
+    else:  # multi
+        gold = pick("slang_definition")
+        d1 = pick("distractor_1_slang_def")
+        d2 = pick("distractor_2_slang_def")
+        d3 = pick("distractor_3_slang_def")
+        candidates = [
+            {"text": gold, "is_correct": True},
+            {"text": d1, "is_correct": False},
+            {"text": d2, "is_correct": False},
+            {"text": d3, "is_correct": False},
+        ]
+
     if any(not c["text"] for c in candidates):
         raise ValueError("Missing option text in record; cannot build options.")
+
     rng.shuffle(candidates)
     labels = ["A", "B", "C", "D"]
     options: Dict[str, str] = {}
@@ -173,6 +260,7 @@ def prepare_options(record: pd.Series, rng: random.Random) -> Tuple[Dict[str, st
         options[label] = candidate["text"]
         if candidate["is_correct"]:
             correct_label = label
+
     if not correct_label:
         raise RuntimeError("Failed to locate correct option after shuffling.")
     return options, correct_label
@@ -182,27 +270,31 @@ def format_options(options: Dict[str, str]) -> str:
     return "\n".join(f"{label}. {text}" for label, text in options.items())
 
 
-def def_only_prompt(definition: str, options: Dict[str, str], language: str) -> str:
-    return (
-        "Select the slang term that matches the definition. "
-        "Respond only with the JSON schema provided earlier.\n"
-        f"Language: {language}\n"
-        f"Definition: {definition}\n"
-        "Options:\n"
-        f"{format_options(options)}"
-    )
-
-
 def context_prompt(
     definition: str,
     sentence: str,
     options: Dict[str, str],
     language: str,
+    prompt_language: str,
+    mode: str,
+    icl_text: str,
 ) -> str:
+    choosing_definition = mode in {"mono", "multi"}
+
+    if prompt_language == "zh":
+        return (
+            f"{'请根据常规定义和示例句来推断该俚语的含义。' if choosing_definition else '请选择既符合定义又能填入示例句的俚语'} "
+            "只能按照前述 JSON 模板回答。\n"
+            f"{icl_text}"
+            f"定义: {definition}\n"
+            f"句子: {sentence}\n"
+            "选项:\n"
+            f"{format_options(options)}"
+        )
     return (
-        "Select the slang term that fits the definition and completes the example sentence. "
+        f"{'Given the conventional definition and how the slang is used (sentence), infer the slang meaning.' if choosing_definition else 'Select the slang term that fits the definition and completes the example sentence.'} "
         "Respond only with the JSON schema provided earlier.\n"
-        f"Language: {language}\n"
+        f"{icl_text}"
         f"Definition: {definition}\n"
         f"Sentence: {sentence}\n"
         "Options:\n"
@@ -219,6 +311,13 @@ def build_result_row(
     parsed: Optional[Dict[str, Any]],
     structured_json: str,
     raw_response: str,
+    prompt_text: Optional[str] = None,
+    *,
+    conv_def_input: str,
+    sentence_input: str,
+    gold_definition: str,
+    icl_shots: int,
+    mode: str,
 ) -> Dict[str, Any]:
     model_choice = None
     rationale = None
@@ -227,11 +326,13 @@ def build_result_row(
         if isinstance(choice_value, str):
             model_choice = choice_value.strip().upper()
         rationale = parsed.get("rationale")
-    return {
+
+    row = {
         "row_id": idx,
         "slang": record.get("slang", ""),
-        "slang_definition": record.get("slang_definition", ""),
-        "sentence_with_blank": record.get("sentence_with_blank", ""),
+        "slang_definition": gold_definition,
+        "conv_def_input": conv_def_input,
+        "sentence_with_blank_input": sentence_input,
         "language": language,
         "option_a": options.get("A"),
         "option_b": options.get("B"),
@@ -244,100 +345,174 @@ def build_result_row(
         "model_response_json": structured_json,
         "raw_response": raw_response,
         "json_valid": parsed is not None,
+        "icl_shots": icl_shots,
+        "mode": mode,
     }
+    if prompt_text is not None:
+        row["prompt_text"] = prompt_text
+    return row
 
 
-def run_def_only_task(
-    df: pd.DataFrame,
-    client: OpenAI,
-    args: argparse.Namespace,
+def has_valid_blank(record: pd.Series, mode: str, language: str) -> bool:
+    if mode == "mono":
+        sentence = str(
+            record.get("sentence_with_blank", "")
+            if language == "en"
+            else record.get("sentence_with_blank_en", "")
+        )
+    else:
+        sentence = str(record.get("sentence_with_blank", ""))
+    return "<BLANK>" in sentence if sentence else False
+
+
+def get_conv_and_sentence(record: pd.Series, mode: str, language: str) -> Tuple[str, str]:
+    if mode == "mono":
+        conv_def = str(
+            record.get("conv_def", "") if language == "en" else record.get("conv_def_en", "")
+        ).strip()
+        sentence = str(
+            record.get("sentence_with_blank", "")
+            if language == "en"
+            else record.get("sentence_with_blank_en", "")
+        ).strip()
+    elif mode == "multi":
+        conv_def = str(record.get("conv_def", "")).strip()
+        sentence = str(record.get("sentence_with_blank", "")).strip()
+    else:  # multi_legacy
+        conv_def = str(record.get("slang_definition", "")).strip()
+        sentence = str(record.get("sentence_with_blank", "")).strip()
+    return conv_def, sentence
+
+
+def load_icl_examples(
     language: str,
-) -> pd.DataFrame:
-    rows: List[Dict[str, Any]] = []
-    iterator = tqdm(
-        df.iterrows(),
-        total=len(df),
-        desc=f"DefOnly-{language}",
-        leave=False,
-    )
-    for idx, record in iterator:
-        definition = str(record.get("slang_definition", "")).strip()
-        if not definition:
-            continue
-        rng = deterministic_rng(args.seed, language, idx)
+    mode: str,
+    prompt_language: str,
+    shots: int,
+    seed: int,
+    chime: bool = False,
+) -> List[str]:
+    if shots <= 0:
+        return []
+
+    if chime and language == "zh":
+        icl_path = DATA_DIR / "zh_generation_chime_icl.csv"
+    elif language == "en":
+        icl_path = DATA_DIR / "en_generation_OD_icl.csv"
+    else:
+        icl_path = DATA_DIR / f"{language}_generation_icl.csv"
+
+    if not icl_path.exists():
+        return []
+
+    df = pd.read_csv(icl_path)
+    df = df[df.apply(lambda r: has_valid_blank(r, mode, language), axis=1)]
+    if df.empty:
+        return []
+
+    sample_n = min(shots, len(df))
+    df = df.sample(n=sample_n, random_state=seed).reset_index(drop=True)
+
+    examples: List[str] = []
+    for idx, record in df.iterrows():
+        rng = deterministic_rng(seed, language, idx)
         try:
-            options, correct_label = prepare_options(record, rng)
-            raw = call_openai_with_retry(
-                client=client,
-                model=args.model,
-                system_prompt=DEF_SYSTEM_PROMPT,
-                user_prompt=def_only_prompt(definition, options, language),
+            options, correct_label = prepare_options(record, rng, mode, language)
+            conv_def, sentence = get_conv_and_sentence(record, mode, language)
+            definition = conv_def if mode in {"mono", "multi"} else str(record.get("slang_definition", "")).strip()
+            block = (
+                f"Example {idx + 1}:\n"
+                f"Definition: {definition}\n"
+                f"Sentence: {sentence}\n"
+                "Options:\n"
+                f"{format_options(options)}\n"
+                f"Answer: {correct_label}\n"
             )
-            parsed, structured = parse_json_response(raw)
-            rows.append(
-                build_result_row(
-                    idx,
-                    language,
-                    record,
-                    options,
-                    correct_label,
-                    parsed,
-                    structured,
-                    raw,
-                )
-            )
-        except Exception as exc:
-            rows.append(
-                {
-                    "row_id": idx,
-                    "slang": record.get("slang", ""),
-                    "slang_definition": definition,
-                    "sentence_with_blank": record.get("sentence_with_blank", ""),
-                    "language": language,
-                    "option_a": None,
-                    "option_b": None,
-                    "option_c": None,
-                    "option_d": None,
-                    "correct_option": None,
-                    "model_choice": None,
-                    "rationale": None,
-                    "is_correct": None,
-                    "model_response_json": "",
-                    "raw_response": "",
-                    "json_valid": False,
-                    "error": str(exc),
-                }
-            )
-    return pd.DataFrame(rows)
+            examples.append(block)
+        except Exception:
+            continue
+
+    if not examples:
+        return []
+
+    joiner = "\n" if prompt_language == "en" else "\n"
+    return [joiner.join(examples) + "\n\n"]
+
+
+def load_dataset(path: Path, debug: bool, debug_samples: int) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    if debug:
+        sample_n = min(debug_samples, len(df))
+        df = df.sample(n=sample_n, random_state=42).reset_index(drop=True)
+    return df
 
 
 def run_context_task(
     df: pd.DataFrame,
-    client: OpenAI,
+    detector: GPTDetector,
     args: argparse.Namespace,
     language: str,
+    store_prompt: bool,
 ) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
-    iterator = tqdm(
-        df.iterrows(),
-        total=len(df),
-        desc=f"Context-{language}",
-        leave=False,
+    icl_blocks = load_icl_examples(
+        language=language,
+        mode=args.mode,
+        prompt_language=args.prompt_language,
+        shots=args.icl_shots,
+        seed=args.seed,
+        chime=getattr(args, "chime", False),
     )
+    icl_text = "".join(icl_blocks)
+
+    iterator = tqdm(df.iterrows(), total=len(df), desc=f"Context-{language}", leave=False)
     for idx, record in iterator:
-        definition = str(record.get("slang_definition", "")).strip()
-        sentence = str(record.get("sentence_with_blank", "")).strip()
+        prompt_payload = None
+
+        if args.mode == "mono":
+            conv_def = str(
+                record.get("conv_def", "") if language == "en" else record.get("conv_def_en", "")
+            ).strip()
+            sentence = str(
+                record.get("sentence_with_blank", "")
+                if language == "en"
+                else record.get("sentence_with_blank_en", "")
+            ).strip()
+            gold_definition = str(
+                record.get("slang_definition", "")
+                if language == "en"
+                else record.get("slang_definition_en", "")
+            ).strip()
+            definition = conv_def
+        elif args.mode == "multi":
+            definition = str(record.get("conv_def", "")).strip()
+            sentence = str(record.get("sentence_with_blank", "")).strip()
+            gold_definition = str(record.get("slang_definition", "")).strip()
+        else:  # multi_legacy
+            definition = str(record.get("slang_definition", "")).strip()
+            sentence = str(record.get("sentence_with_blank", "")).strip()
+            gold_definition = definition
+
         if not definition or not sentence:
             continue
+
         rng = deterministic_rng(args.seed, language, idx)
         try:
-            options, correct_label = prepare_options(record, rng)
-            raw = call_openai_with_retry(
-                client=client,
-                model=args.model,
-                system_prompt=CONTEXT_SYSTEM_PROMPT,
-                user_prompt=context_prompt(definition, sentence, options, language),
+            options, correct_label = prepare_options(record, rng, args.mode, language)
+            system_prompt = CONTEXT_SYSTEM_PROMPTS[args.prompt_language]
+            user_prompt = context_prompt(
+                definition,
+                sentence,
+                options,
+                language,
+                args.prompt_language,
+                args.mode,
+                icl_text,
             )
+            if store_prompt:
+                prompt_payload = f"[SYSTEM]\n{system_prompt}\n[USER]\n{user_prompt}"
+
+            raw = detector.generate(system_prompt=system_prompt, user_prompt=user_prompt)
             parsed, structured = parse_json_response(raw)
             rows.append(
                 build_result_row(
@@ -349,15 +524,22 @@ def run_context_task(
                     parsed,
                     structured,
                     raw,
+                    prompt_payload,
+                    conv_def_input=definition,
+                    sentence_input=sentence,
+                    gold_definition=gold_definition,
+                    icl_shots=args.icl_shots,
+                    mode=args.mode,
                 )
             )
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
             rows.append(
                 {
                     "row_id": idx,
                     "slang": record.get("slang", ""),
-                    "slang_definition": definition,
-                    "sentence_with_blank": sentence,
+                    "slang_definition": gold_definition if "gold_definition" in locals() else "",
+                    "conv_def_input": definition,
+                    "sentence_with_blank_input": sentence,
                     "language": language,
                     "option_a": None,
                     "option_b": None,
@@ -371,49 +553,78 @@ def run_context_task(
                     "raw_response": "",
                     "json_valid": False,
                     "error": str(exc),
+                    "icl_shots": args.icl_shots,
+                    "mode": args.mode,
+                    **({"prompt_text": prompt_payload} if store_prompt else {}),
                 }
             )
+
     return pd.DataFrame(rows)
 
 
-def save_results(df: pd.DataFrame, output_dir: Path, model_name: str, task_name: str) -> Path:
+def save_results(
+    df: pd.DataFrame,
+    output_dir: Path,
+    model_name: str,
+    mode: str,
+    icl_shots: int,
+    chime: bool = False,
+    od_only: bool = False,
+) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     safe_model = sanitize_model_name(model_name)
-    output_path = output_dir / f"{safe_model}_generation_{task_name}.csv"
+    suffix = "_debug" if df.attrs.get("debug_mode") else ""
+    chime_suffix = "_chime" if chime else ""
+    od_only_suffix = "_OD_only" if od_only else ""
+    shots_suffix = f"_{icl_shots}shots" if icl_shots else "_0shots"
+    output_path = output_dir / f"{safe_model}_gpt_generation_{mode}{shots_suffix}{chime_suffix}{od_only_suffix}{suffix}.csv"
     df.to_csv(output_path, index=False, encoding=CSV_ENCODING)
     return output_path
 
 
 def main() -> None:
     args = parse_args()
-    api_key = load_api_key_from_file(args.api_key_file)
-    client = OpenAI(api_key=api_key)
+    detector = GPTDetector(
+        model_id=args.model_id,
+        api_key_file=args.api_key_file,
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        top_p=args.top_p,
+    )
 
-    tasks_to_run = ["def_only", "context"] if args.task == "both" else [args.task]
-    task_frames: Dict[str, List[pd.DataFrame]] = {task: [] for task in tasks_to_run}
+    lang_to_dataset = dict(LANG_TO_DATASET)
+    if args.od:
+        lang_to_dataset = {"en": LANG_TO_DATASET["en"]}
+    elif args.chime:
+        lang_to_dataset["zh"] = DATA_DIR / "zh_generation_chime.csv"
 
-    for language, dataset_path in LANG_TO_DATASET.items():
+    frames: List[pd.DataFrame] = []
+    for language, dataset_path in lang_to_dataset.items():
         if not dataset_path.exists():
             raise FileNotFoundError(f"Dataset not found: {dataset_path}")
-        df = load_dataset(dataset_path)
-        if "def_only" in tasks_to_run:
-            task_frames.setdefault("def_only", []).append(
-                run_def_only_task(df, client, args, language)
-            )
-        if "context" in tasks_to_run:
-            task_frames.setdefault("context", []).append(
-                run_context_task(df, client, args, language)
-            )
+        df = load_dataset(dataset_path, debug=args.debug, debug_samples=args.debug_samples)
+        if args.debug:
+            df.attrs["debug_mode"] = True
+        frames.append(run_context_task(df, detector, args, language, args.debug))
 
-    for task_name in tasks_to_run:
-        frames = task_frames.get(task_name, [])
-        if not frames:
-            continue
-        result_df = pd.concat(frames, ignore_index=True)
-        output_path = save_results(result_df, args.output_dir, args.model, task_name)
-        print(f"Saved {task_name} results to {output_path}")
+    if not frames:
+        raise RuntimeError("No generation results were produced.")
+
+    result_df = pd.concat(frames, ignore_index=True)
+    if args.debug:
+        result_df.attrs["debug_mode"] = True
+
+    output_path = save_results(
+        result_df,
+        args.output_dir,
+        args.model_id,
+        args.mode,
+        args.icl_shots,
+        chime=args.chime,
+        od_only=args.od,
+    )
+    print(f"Saved results to {output_path}")
 
 
 if __name__ == "__main__":
     main()
-

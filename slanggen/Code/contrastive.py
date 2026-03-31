@@ -345,13 +345,20 @@ class SlangGenTrainer:
         se_model = se_model.to(device)
         triplet_head = triplet_head.to(device)
 
-        # Training loop
+        # Training loop (~1/10 tqdm refreshes vs default: update every ~10% of batches)
+        _tqdm_miniters = max(1, len(train_loader) // 10)
+        _tqdm_miniters_dev = max(1, len(dev_loader) // 10)
         best_val_loss = float('inf')
         for epoch in range(params['num_epochs']):
             # Training phase
             triplet_head.train()
             total_loss = 0
-            for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{params['num_epochs']} - Training"):
+            for batch in tqdm(
+                train_loader,
+                desc=f"Epoch {epoch+1}/{params['num_epochs']} train",
+                miniters=_tqdm_miniters,
+                mininterval=1.0,
+            ):
                 anchor_sents, pos_sents, neg_sents = batch
                 # Encode sentences (no grad for encoder)
                 with torch.no_grad():
@@ -375,7 +382,12 @@ class SlangGenTrainer:
             triplet_head.eval()
             val_loss = 0
             with torch.no_grad():
-                for batch in tqdm(dev_loader, desc=f"Epoch {epoch+1}/{params['num_epochs']} - Validation"):
+                for batch in tqdm(
+                    dev_loader,
+                    desc=f"Epoch {epoch+1}/{params['num_epochs']} val",
+                    miniters=_tqdm_miniters_dev,
+                    mininterval=1.0,
+                ):
                     anchor_sents, pos_sents, neg_sents = batch
                     anchor_emb = torch.tensor(se_model.encode(anchor_sents, convert_to_numpy=True)).to(device)
                     pos_emb = torch.tensor(se_model.encode(pos_sents, convert_to_numpy=True)).to(device)
@@ -386,10 +398,9 @@ class SlangGenTrainer:
                     loss = triplet_loss_fn(anchor_proj, pos_proj, neg_proj)
                     val_loss += loss.item()
             avg_val_loss = val_loss / len(dev_loader)
-            print(f"Epoch {epoch+1} average validation loss: {avg_val_loss:.4f}")
 
-            # Save best model
-            if avg_val_loss < best_val_loss:
+            improved = avg_val_loss < best_val_loss
+            if improved:
                 best_val_loss = avg_val_loss
                 save_dict = {
                     'se_model': se_model.state_dict(),
@@ -399,9 +410,14 @@ class SlangGenTrainer:
                     'val_loss': best_val_loss
                 }
                 torch.save(save_dict, output_path + '_with_head.pt')
-                print(f"New best model saved with validation loss: {best_val_loss:.4f}")
 
-        print(f"Training completed. Best validation loss: {best_val_loss:.4f}")
+            # One line per epoch (train + val + optional best)
+            msg = f"Epoch {epoch+1}/{params['num_epochs']}  train_loss={avg_train_loss:.4f}  val_loss={avg_val_loss:.4f}"
+            if improved:
+                msg += f"  (saved best val={best_val_loss:.4f})"
+            print(msg)
+
+        print(f"Done. best_val_loss={best_val_loss:.4f}")
     
     def prep_contrastive_training(self, slang_ind, fold_name='default'):
         
@@ -480,28 +496,48 @@ class SlangGenTrainer:
         return N_triplets, np.asarray(triplets)
     
     def preprocess_word_dist(self):
-    
-        vocab_conv_embeds = np.zeros((self.dataset.V, self.word_encoder.E))
+        model_name = "paraphrase-multilingual-mpnet-base-v2"
+        if self.verbose:
+            print(f"Encoding vocab for word_dist with {model_name} ...")
 
-        for i in range(self.dataset.V):
-            if self.dataset.vocab[i] in self.word_encoder.vocab:
-                vocab_conv_embeds[i,:] = self.word_encoder.norm_embed(self.dataset.vocab[i])
-            else:
-                c_words = self.dataset.vocab[i].split(' ')
-                count = 0
-                if len(c_words) > 1:
-                    embed = np.zeros(self.word_encoder.E)
-                    for w in c_words:
-                        if w in self.word_encoder.vocab:
-                            embed = embed + self.word_encoder.norm_embed(w)
-                            count += 1
-                    if count > 0:
-                        vocab_conv_embeds[i,:] = embed / float(count)
-
-                if count == 0:
-                    vocab_conv_embeds[i,:] = self.word_encoder.norm_embed('unk')
+        vocab_texts = [str(w) if w is not None else "" for w in self.dataset.vocab]
+        mpnet_encoder = SentenceTransformer(model_name)
+        vocab_conv_embeds = np.asarray(
+            mpnet_encoder.encode(
+                vocab_texts,
+                batch_size=128,
+                show_progress_bar=self.verbose,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+            ),
+            dtype=np.float32,
+        )
 
         return dist.squareform(dist.pdist(vocab_conv_embeds, metric='cosine'))
+
+    # def preprocess_word_dist(self):
+        
+    #     vocab_conv_embeds = np.zeros((self.dataset.V, self.word_encoder.E))
+
+    #     for i in range(self.dataset.V):
+    #         if self.dataset.vocab[i] in self.word_encoder.vocab:
+    #             vocab_conv_embeds[i,:] = self.word_encoder.norm_embed(self.dataset.vocab[i])
+    #         else:
+    #             c_words = self.dataset.vocab[i].split(' ')
+    #             count = 0
+    #             if len(c_words) > 1:
+    #                 embed = np.zeros(self.word_encoder.E)
+    #                 for w in c_words:
+    #                     if w in self.word_encoder.vocab:
+    #                         embed = embed + self.word_encoder.norm_embed(w)
+    #                         count += 1
+    #                 if count > 0:
+    #                     vocab_conv_embeds[i,:] = embed / float(count)
+
+    #             if count == 0:
+    #                 vocab_conv_embeds[i,:] = self.word_encoder.norm_embed('unk')
+
+    #     return dist.squareform(dist.pdist(vocab_conv_embeds, metric='cosine'))
 
     def preprocess_contrastive(self, slang_ind):
         
