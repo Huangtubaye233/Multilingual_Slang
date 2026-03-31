@@ -1,7 +1,58 @@
-# Multilingual-Slang
+# Multilingual Slang Generation
 
-Russian Dataset
-{'total_terms': 1534, 'total_defs': 1534, 'total_example_sentences': 1534, 'total_translation_sentences': 1534, 'avg_term_length': 1.1870925684485008, 'avg_def_length': 7.952411994784876, 'avg_example_sentence_length': 17.234680573663624, 'avg_translation_sentence_length': 22.15710560625815}
+This repository contains code and data utilities for multilingual slang generation,
+interpretation, and embedding-based analysis.
 
-Mandarin Dataset
-{'total_terms': 643, 'total_defs': 643, 'total_example_sentences': 643, 'total_translation_sentences': 643, 'avg_term_length': 2.5598755832037323, 'avg_def_length': 8.405909797822707, 'avg_example_sentence_length': 24.33281493001555, 'avg_translation_sentence_length': 14.517884914463453}
+## Project Layout
+
+- `slanggen/`: code for representational level training.
+- `LLM_Eval/`: behavioral level LLM evaluation scripts with datasets.
+- `Data_Collection/`: data collection (of Russian).
+
+## Setup (Conda)
+
+### 1) Create environment (one command)
+
+From the repository root:
+
+```bash
+bash create_slanggen_env.sh
+```
+
+Optional:
+
+- Recreate existing env:
+  ```bash
+  FORCE_RECREATE=1 bash create_slanggen_env.sh
+  ```
+
+### 2) Activate environment
+
+```bash
+conda activate slanggen
+```
+
+### 3) Environment spec
+
+The environment definition is tracked in:
+
+- `environment.slanggen.yml`
+
+## Quick Start
+
+### Slang demo / training workflow
+
+```bash
+cd slanggen/Demo
+jupyter lab
+```
+
+### LLM evaluation scripts
+
+```bash
+cd LLM_Eval
+python run_hf_generation.py --help
+python run_hf_interpretation.py --help
+python run_gpt_generation.py --help
+python run_gpt_interpretation.py --help
+```

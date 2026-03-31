@@ -30,9 +30,9 @@ CSV_ENCODING = "utf-8-sig"
 DEFAULT_CACHE_DIR = Path("/projects/b1170/users/kyx8046/hf-cache")
 
 LANG_TO_DATASET = {
-    "en": DATA_DIR / "en_interpretation.csv",
+    "en": DATA_DIR / "en_interpretation_OD.csv",
     "ru": DATA_DIR / "ru_interpretation.csv",
-    "zh": DATA_DIR / "zh_interpretation.csv",
+    "zh": DATA_DIR / "zh_interpretation_chime.csv",
 }
 
 PROMPT_LANG_CHOICES = ("en", "zh")
@@ -161,6 +161,31 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Number of ICL shots inserted into the prompt (placeholder only for now).",
     )
+    parser.add_argument(
+        "--icl-type",
+        choices=["orig", "others"],
+        default="orig",
+        help=(
+            "ICL source type: orig samples from the same-language ICL CSV; "
+            "others samples from non-target-language ICL CSVs."
+        ),
+    )
+    parser.add_argument(
+        "--icl-lang",
+        choices=tuple(LANG_TO_DATASET.keys()),
+        default=None,
+        help="Language to source ICL examples from (defaults to each dataset language).",
+    )
+    parser.add_argument(
+        "--chime",
+        action="store_true",
+        help="Only run zh on chime dataset (zh_interpretation_chime.csv, zh_interpretation_chime_icl.csv); output suffix _chime.",
+    )
+    parser.add_argument(
+        "--od",
+        action="store_true",
+        help="Run OD-only English evaluation (lang=en only) using OD English datasets; output suffix _OD_only.",
+    )
     return parser.parse_args()
 
 
@@ -237,23 +262,49 @@ def load_icl_examples(
     prompt_language: str,
     shots: int,
     seed: int,
+    chime: bool = False,
+    icl_type: str = "orig",
 ) -> str:
     if shots <= 0:
         return ""
-    icl_path = DATA_DIR / f"{language}_interpretation_icl.csv"
-    if not icl_path.exists():
+
+    def get_icl_path(src_language: str) -> Path:
+        # zh defaults to chime ICL to stay aligned with default zh dataset.
+        if src_language == "zh":
+            return DATA_DIR / "zh_interpretation_chime_icl.csv"
+        if src_language == "en":
+            return DATA_DIR / "en_interpretation_OD_icl.csv"
+        return DATA_DIR / f"{src_language}_interpretation_icl.csv"
+
+    if icl_type == "others":
+        src_langs = [lang for lang in LANG_TO_DATASET.keys() if lang != language]
+    else:
+        src_langs = [language]
+
+    pools: List[pd.DataFrame] = []
+    for src_lang in src_langs:
+        icl_path = get_icl_path(src_lang)
+        if not icl_path.exists():
+            continue
+        src_df = pd.read_csv(icl_path)
+        src_df = src_df[src_df.apply(lambda r: has_valid_blank(r, mode, src_lang), axis=1)]
+        if src_df.empty:
+            continue
+        src_df = src_df.copy()
+        src_df["_icl_src_lang"] = src_lang
+        pools.append(src_df)
+
+    if not pools:
         return ""
-    df = pd.read_csv(icl_path)
-    df = df[df.apply(lambda r: has_valid_blank(r, mode, language), axis=1)]
-    if df.empty:
-        return ""
+    df = pd.concat(pools, ignore_index=True)
     sample_n = min(shots, len(df))
     df = df.sample(n=sample_n, random_state=seed).reset_index(drop=True)
 
     blocks: List[str] = []
     for idx, record in df.iterrows():
         try:
-            inputs = get_inputs(record, mode, language)
+            src_lang = str(record.get("_icl_src_lang", language))
+            inputs = get_inputs(record, mode, src_lang)
             if mode == "multi_legacy":
                 block = (
                     f"Example {idx + 1}:\n"
@@ -330,14 +381,20 @@ def run_interpretation_task(
     store_prompt: bool,
     mode: str,
     icl_shots: int,
+    icl_lang: Optional[str],
+    chime: bool = False,
+    icl_type: str = "orig",
 ) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
+    icl_language = icl_lang or language
     icl_text = load_icl_examples(
-        language=language,
+        language=icl_language,
         mode=mode,
         prompt_language=prompt_language,
         shots=icl_shots,
         seed=42,
+        chime=chime,
+        icl_type=icl_type,
     )
     iterator = tqdm(
         df.iterrows(),
@@ -376,9 +433,10 @@ def run_interpretation_task(
             if not conv_def or not sentence_with_blank:
                 continue
             gold_definition = str(
-                record.get(
-                    "slang_definition",
-                    record.get("slang_definition_en", ""),
+                (
+                    record.get("slang_definition", "")
+                    if language == "en"
+                    else record.get("slang_definition_en", "")
                 )
                 or ""
             )
@@ -455,13 +513,28 @@ def run_interpretation_task(
 
 
 def save_results(
-    df: pd.DataFrame, output_dir: Path, model_name: str, mode: str, icl_shots: int
+    df: pd.DataFrame,
+    output_dir: Path,
+    model_name: str,
+    mode: str,
+    icl_shots: int,
+    icl_type: str,
+    icl_lang: Optional[str],
+    chime: bool = False,
+    od_only: bool = False,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     safe_model = sanitize_model_name(model_name)
     suffix = "_debug" if df.attrs.get("debug_mode") else ""
+    chime_suffix = "_chime" if chime else ""
+    od_only_suffix = "_OD_only" if od_only else ""
+    icl_type_suffix = "_icl_others" if icl_type == "others" else ""
     shots_suffix = f"_{icl_shots}shots" if icl_shots else "_0shots"
-    output_path = output_dir / f"{safe_model}_hf_interpretation_{mode}{shots_suffix}{suffix}.csv"
+    icl_suffix = f"_icl_{icl_lang}" if icl_lang else ""
+    output_path = (
+        output_dir
+        / f"{safe_model}_hf_interpretation_{mode}{shots_suffix}{icl_suffix}{icl_type_suffix}{chime_suffix}{od_only_suffix}{suffix}.csv"
+    )
     df.to_csv(output_path, index=False, encoding=CSV_ENCODING)
     return output_path
 
@@ -495,8 +568,13 @@ def main() -> None:
             top_p=args.top_p,
         )
 
+    lang_to_dataset = dict(LANG_TO_DATASET)
+    if args.od:
+        lang_to_dataset = {"en": LANG_TO_DATASET["en"]}
+    elif args.chime:
+        lang_to_dataset["zh"] = DATA_DIR / "zh_interpretation_chime.csv"
     frames: List[pd.DataFrame] = []
-    for language, dataset_path in LANG_TO_DATASET.items():
+    for language, dataset_path in lang_to_dataset.items():
         if not dataset_path.exists():
             raise FileNotFoundError(f"Dataset not found: {dataset_path}")
         df = load_dataset(dataset_path, debug=args.debug, debug_samples=args.debug_samples)
@@ -511,6 +589,9 @@ def main() -> None:
                 args.debug,
                 args.mode,
                 args.icl_shots,
+                args.icl_lang,
+                chime=args.chime,
+                icl_type=args.icl_type,
             )
         )
 
@@ -521,7 +602,15 @@ def main() -> None:
     if args.debug:
         result_df.attrs["debug_mode"] = True
     output_path = save_results(
-        result_df, args.output_dir, args.model_id, args.mode, args.icl_shots
+        result_df,
+        args.output_dir,
+        args.model_id,
+        args.mode,
+        args.icl_shots,
+        args.icl_type,
+        args.icl_lang,
+        chime=args.chime,
+        od_only=args.od,
     )
     print(f"Saved interpretation results to {output_path}")
 
