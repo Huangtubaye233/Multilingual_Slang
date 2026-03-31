@@ -30,7 +30,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "Generation"
 RESULTS_DIR = BASE_DIR / "Results"
 CSV_ENCODING = "utf-8-sig"
-DEFAULT_CACHE_DIR = Path("/projects/b1170/users/kyx8046/hf-cache")
+DEFAULT_CACHE_DIR = Path("")
 
 LANG_TO_DATASET = {
     "en": DATA_DIR / "en_generation_OD.csv",
