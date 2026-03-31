@@ -15,8 +15,8 @@ if [[ ! -f "${ENV_FILE}" ]]; then
   exit 1
 fi
 
-# Prefer user-provided conda root; fallback to your Quest path.
-CONDA_ROOT="${CONDA_ROOT:-/projects/b1170/users/kyx8046/miniconda3}"
+# Prefer user-provided conda root;
+CONDA_ROOT=""
 CONDA_SH="${CONDA_ROOT}/etc/profile.d/conda.sh"
 
 if [[ ! -f "${CONDA_SH}" ]]; then

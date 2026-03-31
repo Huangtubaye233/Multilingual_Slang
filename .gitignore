@@ -11,6 +11,7 @@ LLM_Eval/archive/
 LLM_Eval/Results/
 LLM_Eval/run_hf_generation.sh
 LLM_Eval/run_hf_interpretation.sh
+LLM_Eval/openai_api_key.txt
 
 slanggen/Demo/.ipynb_checkpoints/
 slanggen/Demo/CatGO/
