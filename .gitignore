@@ -1,6 +1,20 @@
 __pycache__/
 *.py[cod]
 *.pyo
+.ipynb_checkpoints/
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Downloaded model caches and local migration backups
+/models--*/
+/.locks/
+/CACHEDIR.TAG
+/.migration-backup/
+
+# Redundant local link pointing outside this repository
+/CatGO/CatGO
 
 # LLM_Eval artifacts
 LLM_Eval/__pycache__/

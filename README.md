@@ -8,6 +8,11 @@ interpretation, and embedding-based analysis.
 - `slanggen/`: code for representational level training.
 - `LLM_Eval/`: behavioral level LLM evaluation scripts with datasets.
 - `Data_Collection/`: data collection (of Russian).
+- `CatGO/`: vendored categorization library, including local changes. Its files
+  are tracked directly in this repository; no submodule checkout is required.
+  Source: https://github.com/zhewei-sun/CatGO at
+  `47fcf6732d3d92851bb950e287ac1ba85a4425d2`. The original MIT license is retained
+  in `CatGO/LICENSE`.
 
 ## Setup (Conda)
 

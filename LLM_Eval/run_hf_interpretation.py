@@ -6,21 +6,201 @@ Run HF/vLLM interpretation inference to elicit slang definitions.
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
+import torch
 from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from run_hf_detection import (  # type: ignore
-    HFDetector,
-    VLLMDetector,
-    ensure_cache_dir,
-    parse_json_response,
-    resolve_dtype,
-    resolve_vllm_dtype,
-    sanitize_model_name,
-)
+
+def ensure_cache_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def sanitize_model_name(model_name: str) -> str:
+    return (
+        model_name.replace("/", "_")
+        .replace("\\", "_")
+        .replace(":", "_")
+        .replace(" ", "_")
+    )
+
+
+def resolve_dtype(dtype_name: str) -> Optional[torch.dtype]:
+    if dtype_name == "auto":
+        return None
+    mapping = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    return mapping[dtype_name]
+
+
+def resolve_vllm_dtype(dtype_name: str) -> str:
+    # vLLM accepts dtype names as strings.
+    return dtype_name
+
+
+def parse_json_response(text: str) -> tuple[Optional[Dict[str, Any]], str]:
+    if not text:
+        return None, ""
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = stripped.strip("`").strip()
+        if stripped.lower().startswith("json"):
+            stripped = stripped[4:].strip()
+    try:
+        obj = json.loads(stripped)
+        if isinstance(obj, dict):
+            return obj, json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        pass
+    decoder = json.JSONDecoder()
+    for start_idx, ch in enumerate(stripped):
+        if ch != "{":
+            continue
+        try:
+            obj, _ = decoder.raw_decode(stripped[start_idx:])
+            if isinstance(obj, dict):
+                return obj, json.dumps(obj, ensure_ascii=False)
+        except json.JSONDecodeError:
+            continue
+    return None, ""
+
+
+class HFDetector:
+    def __init__(
+        self,
+        model_id: str,
+        cache_dir: Optional[Path],
+        device_map: str,
+        torch_dtype: Optional[torch.dtype],
+        max_new_tokens: int,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+    ) -> None:
+        tokenizer_kwargs: Dict[str, Any] = {"trust_remote_code": True}
+        model_kwargs: Dict[str, Any] = {
+            "device_map": device_map,
+            "trust_remote_code": True,
+            "torch_dtype": torch_dtype,
+        }
+        if cache_dir:
+            cache_str = str(cache_dir)
+            tokenizer_kwargs["cache_dir"] = cache_str
+            model_kwargs["cache_dir"] = cache_str
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id, **tokenizer_kwargs)
+        self.model = AutoModelForCausalLM.from_pretrained(model_id, **model_kwargs)
+        self.max_new_tokens = max_new_tokens
+        self.temperature = temperature
+        self.top_k = top_k
+        self.top_p = top_p
+
+    def _build_prompt(self, system_prompt: str, user_prompt: str) -> str:
+        chat_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            chat_template = getattr(self.tokenizer, "chat_template", None)
+            if chat_template:
+                return self.tokenizer.apply_chat_template(
+                    chat_messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+        return f"System: {system_prompt}\n\nUser: {user_prompt}\n\nAssistant:"
+
+    def generate(self, system_prompt: str, user_prompt: str) -> str:
+        prompt = self._build_prompt(system_prompt, user_prompt)
+        inputs = self.tokenizer(prompt, return_tensors="pt")
+        model_device = next(self.model.parameters()).device
+        inputs = {k: v.to(model_device) for k, v in inputs.items()}
+        do_sample = self.temperature > 0
+        eos_token_id = self.tokenizer.eos_token_id
+        pad_token_id = self.tokenizer.pad_token_id or eos_token_id
+        generate_kwargs: Dict[str, Any] = {
+            "max_new_tokens": self.max_new_tokens,
+            "do_sample": do_sample,
+            "pad_token_id": pad_token_id,
+            "eos_token_id": eos_token_id,
+        }
+        if do_sample:
+            generate_kwargs.update(
+                {
+                    "temperature": self.temperature,
+                    "top_k": self.top_k,
+                    "top_p": self.top_p,
+                }
+            )
+        with torch.no_grad():
+            outputs = self.model.generate(**inputs, **generate_kwargs)
+        generated = outputs[0][inputs["input_ids"].shape[1] :]
+        return self.tokenizer.decode(generated, skip_special_tokens=True).strip()
+
+
+class VLLMDetector:
+    def __init__(
+        self,
+        model_id: str,
+        dtype: str,
+        tensor_parallel_size: int,
+        gpu_memory_utilization: float,
+        max_new_tokens: int,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+    ) -> None:
+        try:
+            from vllm import LLM, SamplingParams  # type: ignore
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError("vLLM is not available in current environment.") from exc
+        self._SamplingParams = SamplingParams
+        self.llm = LLM(
+            model=model_id,
+            dtype=dtype,
+            tensor_parallel_size=tensor_parallel_size,
+            gpu_memory_utilization=gpu_memory_utilization,
+            trust_remote_code=True,
+        )
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        self.max_new_tokens = max_new_tokens
+        self.temperature = temperature
+        self.top_k = top_k
+        self.top_p = top_p
+
+    def _build_prompt(self, system_prompt: str, user_prompt: str) -> str:
+        chat_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            chat_template = getattr(self.tokenizer, "chat_template", None)
+            if chat_template:
+                return self.tokenizer.apply_chat_template(
+                    chat_messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+        return f"System: {system_prompt}\n\nUser: {user_prompt}\n\nAssistant:"
+
+    def generate(self, system_prompt: str, user_prompt: str) -> str:
+        prompt = self._build_prompt(system_prompt, user_prompt)
+        sampling_params = self._SamplingParams(
+            temperature=self.temperature,
+            top_k=self.top_k,
+            top_p=self.top_p,
+            max_tokens=self.max_new_tokens,
+        )
+        outputs = self.llm.generate([prompt], sampling_params)
+        if not outputs or not outputs[0].outputs:
+            return ""
+        return outputs[0].outputs[0].text.strip()
 
 
 BASE_DIR = Path(__file__).resolve().parent
