@@ -1,0 +1,222 @@
+{
+  "data_dir": "size_matched_indices",
+  "index_dir": "size_matched_indices",
+  "output_dir": "representational_results",
+  "word_embedding_cache": "ft_embed_cache_Urban.pickle",
+  "embed_name": "SBERT_mpnet",
+  "training_mode": "head",
+  "categorizer": "cf_prototype_5",
+  "contrastive_params": {
+    "train_batch_size": 8,
+    "num_epochs": 8,
+    "triplet_margin": 0.05,
+    "head_dim": 768,
+    "checkpoint_metric": "dev_roc",
+    "head_lr": 0.0001,
+    "include_epoch_zero": false,
+    "normalize_triplet_embeddings": true,
+    "resample_negatives_each_epoch": true,
+    "neighbor_loss_weight": 0.2
+  },
+  "n_runs": 5,
+  "base_seed": 42,
+  "datasets": {
+    "EN": {
+      "conv": "OD_OSD.npy",
+      "slang": "OSD_V2.npy",
+      "index_suffix": "OD_OSD",
+      "loader": "OSD_Dataset"
+    },
+    "ZH": {
+      "conv": "ZH_conv_data_chime.npy",
+      "slang": "ZH_slang_data_chime.npy",
+      "index_suffix": "ZH_chime",
+      "loader": "ZH_Dataset"
+    },
+    "ZH_zh": {
+      "conv": "ZH_zh_conv_data_chime.npy",
+      "slang": "ZH_zh_slang_data_chime.npy",
+      "index_suffix": "ZH_zh_chime",
+      "loader": "ZH_Dataset"
+    },
+    "RU": {
+      "conv": "RU_conv_data.npy",
+      "slang": "RU_slang_data.npy",
+      "index_suffix": "ru",
+      "loader": "ZH_Dataset"
+    },
+    "RU_ru": {
+      "conv": "RU_ru_conv_data.npy",
+      "slang": "RU_ru_slang_data.npy",
+      "index_suffix": "ru_ru",
+      "loader": "ZH_Dataset"
+    },
+    "mix_ENZH": {
+      "conv": "mix_conv_data_ENZH_OD_chime.npy",
+      "slang": "mix_slang_data_ENZH_OD_chime.npy",
+      "index_suffix": "mix_ENZH_OD_chime",
+      "loader": "OSD_Dataset"
+    },
+    "mix_ENRU": {
+      "conv": "mix_conv_data_ENRU_OD.npy",
+      "slang": "mix_slang_data_ENRU_OD.npy",
+      "index_suffix": "mix_ENRU_OD",
+      "loader": "OSD_Dataset"
+    },
+    "mix_ZHRU": {
+      "conv": "mix_conv_data_ZHRU_chime.npy",
+      "slang": "mix_slang_data_ZHRU_chime.npy",
+      "index_suffix": "mix_ZHRU_chime",
+      "loader": "OSD_Dataset"
+    },
+    "mix_all": {
+      "conv": "mix_conv_data_all_OD_chime.npy",
+      "slang": "mix_slang_data_all_OD_chime.npy",
+      "index_suffix": "mix_all_OD_chime",
+      "loader": "OSD_Dataset"
+    },
+    "mix_multilingual_ENZH": {
+      "conv": "mix_multilingual_conv_data_ENZH_OD_chime.npy",
+      "slang": "mix_multilingual_slang_data_ENZH_OD_chime.npy",
+      "index_suffix": "mix_multilingual_ENZH_OD_chime",
+      "loader": "OSD_Dataset"
+    },
+    "mix_multilingual_ENRU": {
+      "conv": "mix_multilingual_conv_data_ENRU_OD.npy",
+      "slang": "mix_multilingual_slang_data_ENRU_OD.npy",
+      "index_suffix": "mix_multilingual_ENRU_OD",
+      "loader": "OSD_Dataset"
+    },
+    "mix_multilingual_ZHRU": {
+      "conv": "mix_multilingual_conv_data_ZHRU_chime.npy",
+      "slang": "mix_multilingual_slang_data_ZHRU_chime.npy",
+      "index_suffix": "mix_multilingual_ZHRU_chime",
+      "loader": "OSD_Dataset"
+    },
+    "mix_multilingual_all": {
+      "conv": "mix_multilingual_conv_data_all_OD_chime.npy",
+      "slang": "mix_multilingual_slang_data_all_OD_chime.npy",
+      "index_suffix": "mix_multilingual_all_OD_chime",
+      "loader": "OSD_Dataset"
+    }
+  },
+  "experiments": [
+    {
+      "id": "EN_english",
+      "train": "EN",
+      "evaluate": {
+        "EN": "EN",
+        "ZH": "ZH_zh",
+        "RU": "RU_ru"
+      }
+    },
+    {
+      "id": "ZH_english",
+      "train": "ZH",
+      "evaluate": {
+        "EN": "EN",
+        "ZH": "ZH_zh",
+        "RU": "RU_ru"
+      }
+    },
+    {
+      "id": "ZH_original",
+      "train": "ZH_zh",
+      "evaluate": {
+        "EN": "EN",
+        "ZH": "ZH_zh",
+        "RU": "RU_ru"
+      }
+    },
+    {
+      "id": "RU_english",
+      "train": "RU",
+      "evaluate": {
+        "EN": "EN",
+        "ZH": "ZH_zh",
+        "RU": "RU_ru"
+      }
+    },
+    {
+      "id": "RU_original",
+      "train": "RU_ru",
+      "evaluate": {
+        "EN": "EN",
+        "ZH": "ZH_zh",
+        "RU": "RU_ru"
+      }
+    },
+    {
+      "id": "ENZH_english",
+      "train": "mix_ENZH",
+      "evaluate": {
+        "EN": "EN",
+        "ZH": "ZH_zh",
+        "RU": "RU_ru"
+      }
+    },
+    {
+      "id": "ENRU_english",
+      "train": "mix_ENRU",
+      "evaluate": {
+        "EN": "EN",
+        "ZH": "ZH_zh",
+        "RU": "RU_ru"
+      }
+    },
+    {
+      "id": "all_english",
+      "train": "mix_all",
+      "evaluate": {
+        "EN": "EN",
+        "ZH": "ZH_zh",
+        "RU": "RU_ru"
+      }
+    },
+    {
+      "id": "ENZH_original",
+      "train": "mix_multilingual_ENZH",
+      "evaluate": {
+        "EN": "EN",
+        "ZH": "ZH_zh",
+        "RU": "RU_ru"
+      }
+    },
+    {
+      "id": "ENRU_original",
+      "train": "mix_multilingual_ENRU",
+      "evaluate": {
+        "EN": "EN",
+        "ZH": "ZH_zh",
+        "RU": "RU_ru"
+      }
+    },
+    {
+      "id": "all_original",
+      "train": "mix_multilingual_all",
+      "evaluate": {
+        "EN": "EN",
+        "ZH": "ZH_zh",
+        "RU": "RU_ru"
+      }
+    },
+    {
+      "id": "ZHRU_english",
+      "train": "mix_ZHRU",
+      "evaluate": {
+        "EN": "EN",
+        "ZH": "ZH_zh",
+        "RU": "RU_ru"
+      }
+    },
+    {
+      "id": "ZHRU_original",
+      "train": "mix_multilingual_ZHRU",
+      "evaluate": {
+        "EN": "EN",
+        "ZH": "ZH_zh",
+        "RU": "RU_ru"
+      }
+    }
+  ]
+}

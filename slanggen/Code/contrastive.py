@@ -19,7 +19,20 @@ from tqdm import trange
 from .util import *
 from .encoder import SBertWithHeadEncoder
 import os
+from pathlib import Path
 import torch.nn.functional as F
+
+
+def read_triplet_csv(path):
+    # Preserve literal definitions such as "20" and "NA" through the CSV round trip.
+    frame = pd.read_csv(path, dtype=str, keep_default_na=False)
+    for column in ('anchor', 'positive', 'negative'):
+        for row, text in enumerate(frame[column]):
+            try:
+                prepare_definition_text(text)
+            except ValueError as exc:
+                raise ValueError(f"{path}: invalid {column} at data row {row + 1}") from exc
+    return frame
 
 class SlangGenTrainer:
     
@@ -178,23 +191,15 @@ class SlangGenTrainer:
         if self.verbose:
             print("Encoding sense definitions...")
             
-        out_dir = self.out_dir + '/' + fold_name + '/'
-        
-        # Determine the correct filename based on the encoder type
-        if hasattr(self.sense_encoder, 'name'):
-            if '_multilingual_distilled' in self.sense_encoder.name:
-                filename = "sum_embed_" + self.sense_encoder.name + ".npz"
-            elif '_whole_finetuned' in self.sense_encoder.name:
-                filename = "sum_embed_" + self.sense_encoder.name + ".npz"
-            elif '_with_head' in self.sense_encoder.name:
-                filename = "sum_embed_" + self.sense_encoder.name + ".npz"
-            else:
-                filename = "sum_embed_" + self.sense_encoder.name + ".npz"
-        else:
-            filename = "sum_embed_" + self.sense_encoder.name + ".npz"
+        out_dir = Path(self.out_dir) / fold_name
+        out_dir.mkdir(parents=True, exist_ok=True)
+        # Keep encoder identifiers out of the directory structure, including
+        # names produced by older encoders with mixed path separators.
+        encoder_name = Path(str(self.sense_encoder.name).replace('\\', '/')).name
+        filename = "sum_embed_" + encoder_name + ".npz"
             
         sense_embeds = self.sense_encoder.encode_dataset(self.dataset, slang_ind)
-        np.savez(out_dir + filename, train=sense_embeds['train'], dev=sense_embeds['dev'], test=sense_embeds['test'], standard=sense_embeds['standard'])
+        np.savez(out_dir / filename, train=sense_embeds['train'], dev=sense_embeds['dev'], test=sense_embeds['test'], standard=sense_embeds['standard'])
         
         if self.verbose:
             print("Complete!")
@@ -254,9 +259,31 @@ class SlangGenTrainer:
     #               output_path=output_path)
         
     # only fine-tune the triplet head
-    def train_contrastive_model_head(self, slang_ind, params=None, fold_name='default', embed_name='SBERT_contrastive'):
+    def train_contrastive_model_head(self, slang_ind, params=None, fold_name='default', embed_name='SBERT_contrastive', categorizer='cf_prototype_5', sentence_encoder=None, save_checkpoint=True):
         if params is None:
             params = {'train_batch_size':8, 'num_epochs':4, 'triplet_margin':1, 'outpath':embed_name, 'head_dim':768}
+
+        checkpoint_metric = params.get('checkpoint_metric', 'dev_roc')
+        if checkpoint_metric not in ('dev_roc', 'dev_loss'):
+            raise ValueError('checkpoint_metric must be dev_roc or dev_loss')
+        include_epoch_zero = params.get('include_epoch_zero', False)
+        if type(include_epoch_zero) is not bool:
+            raise ValueError('include_epoch_zero must be a boolean')
+        normalize_triplet_embeddings = params.get('normalize_triplet_embeddings', False)
+        if type(normalize_triplet_embeddings) is not bool:
+            raise ValueError('normalize_triplet_embeddings must be a boolean')
+        resample_negatives = params.get('resample_negatives_each_epoch', False)
+        if type(resample_negatives) is not bool:
+            raise ValueError('resample_negatives_each_epoch must be a boolean')
+        neighbor_weight = params.get('neighbor_loss_weight', 1.0)
+        if type(neighbor_weight) not in (int, float) or not np.isfinite(neighbor_weight) or neighbor_weight < 0:
+            raise ValueError('neighbor_loss_weight must be a finite nonnegative number')
+        weighted_loss = neighbor_weight != 1.0
+        if type(params['num_epochs']) is not int or params['num_epochs'] < 1:
+            raise ValueError('num_epochs must be a positive integer')
+        head_lr = float(params.get('head_lr', 1e-4))
+        if not np.isfinite(head_lr) or head_lr <= 0:
+            raise ValueError('head_lr must be positive and finite')
 
         self.prep_contrastive_training(slang_ind, fold_name=fold_name)
         
@@ -268,7 +295,9 @@ class SlangGenTrainer:
         output_path = out_dir + params['outpath']
 
         # Load encoder based on embed_name
-        if embed_name == 'SBERT_contrastive':
+        if sentence_encoder is not None:
+            se_model = sentence_encoder
+        elif embed_name == 'SBERT_contrastive':
             se_model = SentenceTransformer('bert-base-nli-mean-tokens')
         elif embed_name == 'SBERT_t5':
             se_model = SentenceTransformer('sentence-t5-base')
@@ -277,9 +306,9 @@ class SlangGenTrainer:
         elif embed_name == 'SBERT_LaBSE':
             se_model = SentenceTransformer('LaBSE')
         elif embed_name == 'SBERT_mpnet':
-            se_model = SentenceTransformer('paraphrase-multilingual-mpnet-base-v2')
+            se_model = SentenceTransformer(resolve_sentence_model_path('paraphrase-multilingual-mpnet-base-v2'))
         elif embed_name == 'SBERT_e5_base':  
-            se_model = SentenceTransformer('intfloat/multilingual-e5-base')
+            se_model = SentenceTransformer(resolve_sentence_model_path('intfloat/multilingual-e5-base'))
         elif embed_name == 'SBERT_e5_large':
             se_model = SentenceTransformer('intfloat/multilingual-e5-large')
         else:
@@ -289,6 +318,13 @@ class SlangGenTrainer:
         se_model.eval()
         for param in se_model.parameters():
             param.requires_grad = False  # Freeze encoder
+
+        definition_prefix = 'query: ' if embed_name == 'SBERT_e5_base' else ''
+
+        def encode_definitions(sentences, **kwargs):
+            if definition_prefix:
+                sentences = [definition_prefix + text for text in sentences]
+            return se_model.encode(sentences, **kwargs)
 
         class TripletHead(nn.Module):
             def __init__(self, input_dim, output_dim):
@@ -300,44 +336,77 @@ class SlangGenTrainer:
         embed_dim = se_model.get_sentence_embedding_dimension()
         head_dim = params.get('head_dim', 768)
         triplet_head = TripletHead(embed_dim, head_dim).cuda() if torch.cuda.is_available() else TripletHead(embed_dim, head_dim)
+        initialize_identity_head(triplet_head.linear)
 
         # Triplet Loss
-        triplet_loss_fn = nn.TripletMarginLoss(margin=params['triplet_margin'], p=2)
+        triplet_loss_fn = nn.TripletMarginLoss(margin=params['triplet_margin'], p=2,
+                                             reduction='none' if weighted_loss else 'mean')
+
+        def compute_triplet_loss(anchor, positive, negative, weights=None, normalizer=1.0):
+            if normalize_triplet_embeddings:
+                anchor, positive, negative = (F.normalize(x, p=2, dim=-1)
+                                              for x in (anchor, positive, negative))
+            losses = triplet_loss_fn(anchor, positive, negative)
+            if weighted_loss:
+                weights = torch.as_tensor(weights, dtype=losses.dtype, device=losses.device)
+                # Fixed split-wide denominator avoids cancelling weights in
+                # all-neighbor minibatches (or when batch size is one).
+                return (losses * weights).mean() / normalizer
+            return losses
 
         # Optimizer (only head)
-        optimizer = optim.Adam(triplet_head.parameters(), lr=1e-4)
+        optimizer = optim.Adam(triplet_head.parameters(), lr=head_lr)
 
         # Prepare triplet data
         class TripletDataset(Dataset):
-            def __init__(self, anchors, positives, negatives):
+            def __init__(self, anchors, positives, negatives, weights):
                 self.anchors = anchors
                 self.positives = positives
                 self.negatives = negatives
+                self.weights = weights
             def __len__(self):
                 return len(self.anchors)
             def __getitem__(self, idx):
-                return self.anchors[idx], self.positives[idx], self.negatives[idx]
+                return self.anchors[idx], self.positives[idx], self.negatives[idx], self.weights[idx]
 
         def triplet_collate(batch):
             return list(zip(*batch))
         
         # Load triplets from CSV
-        train_df = pd.read_csv(out_dir+'contrastive_train.csv')
-        dev_df = pd.read_csv(out_dir+'contrastive_dev.csv')
-        for df in (train_df, dev_df):
-            df.dropna(subset=['anchor', 'positive', 'negative'], inplace=True)
-            df[['anchor', 'positive', 'negative']] = df[['anchor', 'positive', 'negative']].astype(str)
+        train_df = read_triplet_csv(out_dir+'contrastive_train.csv')
+        dev_df = read_triplet_csv(out_dir+'contrastive_dev.csv')
+        split_weights = {split: np.ones(len(frame), dtype=np.float32)
+                         for split, frame in [('train', train_df), ('dev', dev_df)]}
+        if weighted_loss or resample_negatives:
+            pools = self.load_preprocessed_data(fold_name=fold_name)
+            train_triplets = np.load(out_dir+'triplets.npy').copy()
+            if weighted_loss:
+                for split, triplets in [('train', train_triplets),
+                                        ('dev', np.load(out_dir+'triplets_dev.npy'))]:
+                    # Use definition indices, not text equality: distinct words
+                    # can share a definition, and old words have multiple senses.
+                    gold = [set(row['positive'].tolist()) for row in pools['cp_'+split]]
+                    split_weights[split] = np.asarray([
+                        1.0 if int(p) in gold[int(a)] else neighbor_weight
+                        for a, p, _ in triplets], dtype=np.float32)
+                    if len(split_weights[split]) == 0 or split_weights[split].mean() <= 0:
+                        raise ValueError(f'{split}: triplet weights must have a positive total')
+                    np.save(out_dir+f'triplet_weights_{split}.npy', split_weights[split])
+            if resample_negatives:
+                conv_texts = [prepare_definition_text(d['def']) for word in self.dataset.vocab
+                              for d in self.dataset.conv_data[word].definitions]
+        weight_normalizers = {split: float(weights.mean()) for split, weights in split_weights.items()}
         anchors = train_df['anchor'].tolist()
         positives = train_df['positive'].tolist()
         negatives = train_df['negative'].tolist()
-        train_dataset = TripletDataset(anchors, positives, negatives)
+        train_dataset = TripletDataset(anchors, positives, negatives, split_weights['train'])
         train_loader = DataLoader(train_dataset, batch_size=params['train_batch_size'], shuffle=True, collate_fn=triplet_collate)
 
         # Create validation dataset and loader
         dev_anchors = dev_df['anchor'].tolist()
         dev_positives = dev_df['positive'].tolist()
         dev_negatives = dev_df['negative'].tolist()
-        dev_dataset = TripletDataset(dev_anchors, dev_positives, dev_negatives)
+        dev_dataset = TripletDataset(dev_anchors, dev_positives, dev_negatives, split_weights['dev'])
         dev_loader = DataLoader(dev_dataset, batch_size=params['train_batch_size'], shuffle=False, collate_fn=triplet_collate)
 
         # Move models to device
@@ -348,8 +417,73 @@ class SlangGenTrainer:
         # Training loop (~1/10 tqdm refreshes vs default: update every ~10% of batches)
         _tqdm_miniters = max(1, len(train_loader) // 10)
         _tqdm_miniters_dev = max(1, len(dev_loader) // 10)
-        best_val_loss = float('inf')
+        best_score, best_epoch, history = None, None, []
+        if checkpoint_metric == 'dev_roc':
+            from .model import SlangGenModel
+            dev_model = SlangGenModel(self)
+            # Frozen encoder outputs are cached once. Test slang is never encoded
+            # here; candidate conventional definitions remain available as usual.
+            sentences = {split: [prepare_definition_text(self.dataset.slang_data[i].def_sent)
+                                 for i in getattr(slang_ind, split)] for split in ('train', 'dev')}
+            sentences['standard'] = [prepare_definition_text(d['def']) for word in self.dataset.vocab
+                                     for d in self.dataset.conv_data[word].definitions]
+            with torch.no_grad():
+                base_embeds = {split: encode_definitions(texts, convert_to_tensor=True).to(device)
+                               for split, texts in sentences.items()}
+
+        def validate_and_save(epoch, train_loss):
+            nonlocal best_score, best_epoch
+            triplet_head.eval()
+            val_loss = 0.0
+            with torch.no_grad():
+                for batch in tqdm(dev_loader, desc=f'Epoch {epoch} val',
+                                  miniters=_tqdm_miniters_dev, mininterval=1.0):
+                    anchor_sents, pos_sents, neg_sents, weights = batch
+                    embeds = [torch.tensor(encode_definitions(sents, convert_to_numpy=True)).to(device)
+                              for sents in (anchor_sents, pos_sents, neg_sents)]
+                    batch_loss = compute_triplet_loss(*(triplet_head(x) for x in embeds),
+                        weights=weights, normalizer=weight_normalizers['dev']).item()
+                    val_loss += batch_loss * (len(weights) if weighted_loss else 1)
+                val_loss /= len(dev_dataset) if weighted_loss else len(dev_loader)
+                dev_roc = None
+                if checkpoint_metric == 'dev_roc':
+                    projected = {split: normalize_L2(triplet_head(x).cpu().numpy(), axis=1)
+                                 for split, x in base_embeds.items()}
+                    dev_roc = dev_model.evaluate_dev_roc(projected, slang_ind, categorizer,
+                                                        os.path.join(out_dir, 'dev_selection'))
+            score = dev_roc if checkpoint_metric == 'dev_roc' else -val_loss
+            if not np.isfinite(score):
+                raise ValueError('Nonfinite checkpoint selection metric')
+            # A tie retains the earlier eligible epoch.
+            improved = best_score is None or score > best_score
+            if improved:
+                best_score, best_epoch = score, epoch
+                if save_checkpoint:
+                    torch.save({'se_model': se_model.state_dict(), 'triplet_head': triplet_head.state_dict(),
+                                'head_dim': head_dim, 'embed_dim': embed_dim, 'val_loss': val_loss,
+                                'dev_roc': dev_roc, 'epoch': epoch, 'checkpoint_metric': checkpoint_metric,
+                                'head_lr': head_lr,
+                                'definition_prefix': definition_prefix,
+                                'resample_negatives_each_epoch': resample_negatives,
+                                'neighbor_loss_weight': neighbor_weight,
+                                'normalize_triplet_embeddings': normalize_triplet_embeddings}, output_path + '_with_head.pt')
+            history.append({'epoch': epoch, 'train_loss': train_loss, 'dev_loss': val_loss, 'dev_roc': dev_roc})
+            for row in history:
+                row['selected'] = row['epoch'] == best_epoch
+            pd.DataFrame(history).to_csv(os.path.join(out_dir, 'epoch_metrics.csv'), index=False)
+            print(f'Epoch {epoch}: dev_loss={val_loss:.4f}, dev_roc={dev_roc}, selected_epoch={best_epoch}')
+
+        if checkpoint_metric == 'dev_roc' and include_epoch_zero:
+            validate_and_save(0, None)
         for epoch in range(params['num_epochs']):
+            if resample_negatives:
+                # Epoch 1 uses the original draw. Resample training negatives
+                # only from epoch 2; dev triplets stay fixed for comparison.
+                if epoch > 0:
+                    for row in train_triplets:
+                        row[2] = np.random.choice(pools['cp_train'][int(row[0])]['negative'])
+                    train_dataset.negatives = [conv_texts[int(n)] for n in train_triplets[:, 2]]
+                np.save(out_dir+f'triplets_epoch_{epoch+1:03d}.npy', train_triplets)
             # Training phase
             triplet_head.train()
             total_loss = 0
@@ -359,65 +493,31 @@ class SlangGenTrainer:
                 miniters=_tqdm_miniters,
                 mininterval=1.0,
             ):
-                anchor_sents, pos_sents, neg_sents = batch
+                anchor_sents, pos_sents, neg_sents, weights = batch
+                if weighted_loss and not any(weights):
+                    continue  # No Adam momentum update for a zero-weight batch.
                 # Encode sentences (no grad for encoder)
                 with torch.no_grad():
-                    anchor_emb = torch.tensor(se_model.encode(anchor_sents, convert_to_numpy=True)).to(device)
-                    pos_emb = torch.tensor(se_model.encode(pos_sents, convert_to_numpy=True)).to(device)
-                    neg_emb = torch.tensor(se_model.encode(neg_sents, convert_to_numpy=True)).to(device)
+                    anchor_emb = torch.tensor(encode_definitions(anchor_sents, convert_to_numpy=True)).to(device)
+                    pos_emb = torch.tensor(encode_definitions(pos_sents, convert_to_numpy=True)).to(device)
+                    neg_emb = torch.tensor(encode_definitions(neg_sents, convert_to_numpy=True)).to(device)
                 # Pass through Triplet Head
                 anchor_proj = triplet_head(anchor_emb)
                 pos_proj = triplet_head(pos_emb)
                 neg_proj = triplet_head(neg_emb)
                 # Compute loss
-                loss = triplet_loss_fn(anchor_proj, pos_proj, neg_proj)
+                loss = compute_triplet_loss(anchor_proj, pos_proj, neg_proj,
+                    weights=weights, normalizer=weight_normalizers['train'])
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                total_loss += loss.item()
-            avg_train_loss = total_loss / len(train_loader)
+                total_loss += loss.item() * (len(weights) if weighted_loss else 1)
+            avg_train_loss = total_loss / (len(train_dataset) if weighted_loss else len(train_loader))
             print(f"Epoch {epoch+1} average training loss: {avg_train_loss:.4f}")
 
-            # Validation phase
-            triplet_head.eval()
-            val_loss = 0
-            with torch.no_grad():
-                for batch in tqdm(
-                    dev_loader,
-                    desc=f"Epoch {epoch+1}/{params['num_epochs']} val",
-                    miniters=_tqdm_miniters_dev,
-                    mininterval=1.0,
-                ):
-                    anchor_sents, pos_sents, neg_sents = batch
-                    anchor_emb = torch.tensor(se_model.encode(anchor_sents, convert_to_numpy=True)).to(device)
-                    pos_emb = torch.tensor(se_model.encode(pos_sents, convert_to_numpy=True)).to(device)
-                    neg_emb = torch.tensor(se_model.encode(neg_sents, convert_to_numpy=True)).to(device)
-                    anchor_proj = triplet_head(anchor_emb)
-                    pos_proj = triplet_head(pos_emb)
-                    neg_proj = triplet_head(neg_emb)
-                    loss = triplet_loss_fn(anchor_proj, pos_proj, neg_proj)
-                    val_loss += loss.item()
-            avg_val_loss = val_loss / len(dev_loader)
+            validate_and_save(epoch + 1, avg_train_loss)
 
-            improved = avg_val_loss < best_val_loss
-            if improved:
-                best_val_loss = avg_val_loss
-                save_dict = {
-                    'se_model': se_model.state_dict(),
-                    'triplet_head': triplet_head.state_dict(),
-                    'head_dim': head_dim,
-                    'embed_dim': embed_dim,
-                    'val_loss': best_val_loss
-                }
-                torch.save(save_dict, output_path + '_with_head.pt')
-
-            # One line per epoch (train + val + optional best)
-            msg = f"Epoch {epoch+1}/{params['num_epochs']}  train_loss={avg_train_loss:.4f}  val_loss={avg_val_loss:.4f}"
-            if improved:
-                msg += f"  (saved best val={best_val_loss:.4f})"
-            print(msg)
-
-        print(f"Done. best_val_loss={best_val_loss:.4f}")
+        print(f'Done. checkpoint_metric={checkpoint_metric}, selected_epoch={best_epoch}, score={best_score}')
     
     def prep_contrastive_training(self, slang_ind, fold_name='default'):
         
@@ -437,13 +537,13 @@ class SlangGenTrainer:
             
         slang_def_sents = []
         for i in range(self.dataset.N_total):
-            slang_def_sents.append(' '.join(simple_preprocess(self.dataset.slang_data[i].def_sent)))
+            slang_def_sents.append(prepare_definition_text(self.dataset.slang_data[i].def_sent))
 
         conv_def_sents = []
         for i in range(self.dataset.V):
             word = self.dataset.vocab[i]
             for d in self.dataset.conv_data[word].definitions:
-                conv_def_sents.append(' '.join(simple_preprocess(d['def'])))
+                conv_def_sents.append(prepare_definition_text(d['def']))
         
         data_train = {'anchor':[slang_def_sents[slang_ind.train[triplets[i][0]]] for i in range(N_train)],\
                       'positive':[conv_def_sents[triplets[i][1]] for i in range(N_train)],\
@@ -501,7 +601,7 @@ class SlangGenTrainer:
             print(f"Encoding vocab for word_dist with {model_name} ...")
 
         vocab_texts = [str(w) if w is not None else "" for w in self.dataset.vocab]
-        mpnet_encoder = SentenceTransformer(model_name)
+        mpnet_encoder = SentenceTransformer(resolve_sentence_model_path(model_name))
         vocab_conv_embeds = np.asarray(
             mpnet_encoder.encode(
                 vocab_texts,
@@ -640,6 +740,7 @@ class SlangGenTrainer:
         embed_dim = se_model.get_sentence_embedding_dimension()
         head_dim = params.get('head_dim', 768)
         triplet_head = TripletHead(embed_dim, head_dim).cuda() if torch.cuda.is_available() else TripletHead(embed_dim, head_dim)
+        initialize_identity_head(triplet_head.linear)
 
         # Triplet Loss
         triplet_loss_fn = nn.TripletMarginLoss(margin=params['triplet_margin'], p=2)
@@ -667,11 +768,8 @@ class SlangGenTrainer:
             return list(zip(*batch)) 
         
         # Load triplets from CSV
-        train_df = pd.read_csv(out_dir+'contrastive_train.csv')
-        dev_df = pd.read_csv(out_dir+'contrastive_dev.csv')
-        for df in (train_df, dev_df):
-            df.dropna(subset=['anchor', 'positive', 'negative'], inplace=True)
-            df[['anchor', 'positive', 'negative']] = df[['anchor', 'positive', 'negative']].astype(str)
+        train_df = read_triplet_csv(out_dir+'contrastive_train.csv')
+        dev_df = read_triplet_csv(out_dir+'contrastive_dev.csv')
         anchors = train_df['anchor'].tolist()
         positives = train_df['positive'].tolist()
         negatives = train_df['negative'].tolist()

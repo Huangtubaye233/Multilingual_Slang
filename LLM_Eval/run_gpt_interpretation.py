@@ -14,7 +14,7 @@ import pandas as pd
 from openai import OpenAI
 from tqdm import tqdm
 
-from run_gpt_detection import (  # type: ignore
+from llm_utils import (
     load_api_key_from_file,
     parse_json_response,
     sanitize_model_name,

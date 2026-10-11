@@ -38,13 +38,29 @@ class SlangGenModel:
         self.trainer.preprocess_slang_data(slang_ind, fold_name=fold_name)
         if mode == 'head':
             print('Training contrastive model with head')
-            self.trainer.train_contrastive_model_head(slang_ind, fold_name=fold_name, params=params['contr_params'], embed_name=params['embed_name'])
+            self.trainer.train_contrastive_model_head(slang_ind, fold_name=fold_name, params=params['contr_params'], embed_name=params['embed_name'], categorizer=params['model'])
         else:
             print('Training contrastive model with whole model')
             self.trainer.train_contrastive_model_whole(slang_ind, fold_name=fold_name, params=params['contr_params'], embed_name=params['embed_name'])
         # self.trainer.train_contrastive_model_whole(slang_ind, fold_name=fold_name, params=params['contr_params'], embed_name=params['embed_name'])
         self.trainer.get_trained_embeddings(slang_ind, fold_name=fold_name, model_path=params['embed_name'])
         
+    def evaluate_dev_roc(self, def_embeds, slang_ind, categorizer, output_dir):
+        """Fit CatGO on train only and score held-out dev with the test metric."""
+        vocab_embeds = self.load_examplar_embeddings(def_embeds=def_embeds)
+        create_directory(output_dir)
+        for split in ('train', 'dev'):
+            model = Categorizer(self.vocab, vocab_embeds, self.cf_feats)
+            model.set_datadir(os.path.join(str(output_dir), ''))
+            # CatGO mode='dev' loads train-fitted parameters without optimizing.
+            model.run_categorization(def_embeds[split], self.labels[getattr(slang_ind, split)],
+                                     models=[categorizer], prior='uniform', mode=split)
+        scores = np.load(os.path.join(output_dir, f'l_{categorizer}_uniform_dev.npy'))
+        if scores.shape != (len(slang_ind.dev), len(self.vocab)) or not np.isfinite(scores).all():
+            raise ValueError('Invalid CatGO dev predictions')
+        rankings = get_rankings(scores, slang_ind.dev, self.labels)
+        return float(np.mean(get_roc(rankings, len(self.vocab))))
+
     def train_categorization(self, slang_ind, fold_name='default', params=None):
         
         if params is None:

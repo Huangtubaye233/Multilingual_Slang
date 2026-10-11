@@ -1,3 +1,6 @@
+# Shared Windows/Linux NVIDIA environment for representational experiments,
+# overlap analysis, and GPT/Hugging Face evaluation (HF backend).
+# Gemma-4 judging uses the separate LLM_Eval/setup_gemma_judge_conda.sh environment.
 name: slanggen
 channels:
   - conda-forge
@@ -12,23 +15,20 @@ dependencies:
   - nltk=3.9.1
   - gensim=4.3.2
   - jupyterlab=4.5.4
-  - notebook=7.5.3
   - sentencepiece=0.2.0
   - tqdm=4.67.1
-  - openai=2.21.0
+  - matplotlib=3.9.2
   - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - torch==2.8.0+cu128
       - accelerate==1.12.0
-      - cupy-cuda12x==13.6.0
+      - beautifulsoup4==4.14.3
       - huggingface-hub==0.36.0
-      - openai-harmony==0.0.8
-      - ray==2.52.1
+      - openai==3.24.0
+      - protobuf==6.33.5
+      - python-dotenv==1.2.4
+      - requests==2.34.2
       - safetensors==0.5.3
       - sentence-transformers==2.6.1
       - tokenizers==0.22.1
-      - torch==2.8.0
-      - torchaudio==2.8.0
-      - torchvision==0.23.0
       - transformers==4.57.3
-      - triton==3.4.0
-      - vllm==0.11.0
-      - xformers==0.0.32.post1

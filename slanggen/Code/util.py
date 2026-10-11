@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 from collections import namedtuple
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -30,6 +31,36 @@ Triplet = namedtuple('Triplet', ['anchor', 'positive', 'negative'])
 
 # one-time debug flag for get_conv_def
 _GET_CONV_DEF_PRINTED = False
+
+
+def prepare_definition_text(text):
+    """Keep the original definition intact for the encoder's own tokenizer."""
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError(f"Expected a nonempty definition string, got {text!r}")
+    return text
+
+
+def resolve_sentence_model_path(model_name):
+    """Use repository encoder snapshots when available, including offline runs."""
+    name = 'paraphrase-multilingual-mpnet-base-v2'
+    if str(model_name) in (name, 'sentence-transformers/' + name):
+        local = Path(__file__).resolve().parents[2] / 'models' / name
+        if (local / 'modules.json').is_file():
+            return str(local)
+    if str(model_name) in ('multilingual-e5-base', 'intfloat/multilingual-e5-base'):
+        local = Path(__file__).resolve().parents[2] / 'models' / 'multilingual-e5-base'
+        if (local / 'modules.json').is_file():
+            return str(local)
+    return model_name
+
+
+def initialize_identity_head(linear):
+    """Start a square projection at the pretrained embedding space."""
+    if linear.in_features != linear.out_features:
+        raise ValueError("Identity head initialization requires head_dim == embedding dimension")
+    torch.nn.init.eye_(linear.weight)
+    if linear.bias is not None:
+        torch.nn.init.zeros_(linear.bias)
 
 def tokenize(sentence):
     return re.compile(r"(?:^|(?<=\s))\S+(?=\s|$)").findall(sentence)

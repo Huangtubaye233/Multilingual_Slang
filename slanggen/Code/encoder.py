@@ -3,6 +3,7 @@
 import io
 import abc
 import pickle
+from pathlib import Path
 import torch
 import torch.nn as nn
 
@@ -79,10 +80,7 @@ class SenseEncoder:
             sentences = []
             for i in ind:
                 text = dataset.slang_data[i].def_sent
-                if contains_english(text):
-                    sentences.append(' '.join(simple_preprocess(text)))
-                else:
-                    sentences.append(text)
+                sentences.append(prepare_definition_text(text))
             return sentences
         
         embeds['train'] = self.encode_sentences(collect_slang_sents(dataset, slang_ind.train))
@@ -94,10 +92,7 @@ class SenseEncoder:
             word = dataset.vocab[i]
             for d in dataset.conv_data[word].definitions:
                 text = d['def']
-                if contains_english(text):
-                    sentences.append(' '.join(simple_preprocess(text)))
-                else:
-                    sentences.append(text)
+                sentences.append(prepare_definition_text(text))
           
         embeds['standard'] = self.encode_sentences(sentences)
         
@@ -119,7 +114,7 @@ class SBertEncoder(SenseEncoder):
         else:
             self.name = sbert_model_name
             
-        self.sbert_model = SentenceTransformer(sbert_model_name)
+        self.sbert_model = SentenceTransformer(resolve_sentence_model_path(sbert_model_name))
         
     def encode_sentences(self, sentences):
         
@@ -138,7 +133,7 @@ class SBertWithHeadEncoder(SenseEncoder):
             print("Cleared GPU cache before loading model")
         
         # Load SBERT
-        self.sbert_model = SentenceTransformer(sbert_model_name).to(device)
+        self.sbert_model = SentenceTransformer(resolve_sentence_model_path(sbert_model_name)).to(device)
         
         # Load head and config with memory optimization
         try:
@@ -155,6 +150,9 @@ class SBertWithHeadEncoder(SenseEncoder):
             embed_dim = checkpoint['embed_dim']
             head_dim = checkpoint['head_dim']
         
+        # Historical checkpoints had no prefix; new E5 head checkpoints record it.
+        self.definition_prefix = checkpoint.get('definition_prefix', '')
+
         class TripletHead(nn.Module):
             def __init__(self, input_dim, output_dim):
                 super().__init__()
@@ -176,13 +174,16 @@ class SBertWithHeadEncoder(SenseEncoder):
             raise KeyError('Unsupported checkpoint schema: expected (se_model, triplet_head) or (student_model, student_head)')
         self.sbert_model.eval()
         self.triplet_head.eval()
-        self.name = head_path.split('/')[-1].replace('.pt','')
+        # Checkpoint paths can contain either separator on Windows.
+        self.name = Path(str(head_path).replace('\\', '/')).stem
 
     def encode_sentences(self, sentences, batch_size=32):
         all_embeds = []
         with torch.no_grad():
             for i in range(0, len(sentences), batch_size):
                 batch = sentences[i:i+batch_size]
+                if self.definition_prefix:
+                    batch = [self.definition_prefix + text for text in batch]
                 # Encode with SBERT
                 sbert_emb = self.sbert_model.encode(batch, convert_to_tensor=True).to(self.device)
                 # Pass through head
@@ -190,7 +191,13 @@ class SBertWithHeadEncoder(SenseEncoder):
                 all_embeds.append(head_emb.cpu().numpy())
         return normalize_L2(np.vstack(all_embeds), axis=1)
     
-def dump_vanilla_embeddings(trainer, slang_inds, fold_name, embed_name='SBERT_mpnet'):
+def dump_vanilla_embeddings(trainer, slang_inds, fold_name, embed_name='SBERT_mpnet',
+                            *, encoder=None, save_checkpoint=True):
+    """Original demo baseline; optionally reuse an encoder and omit its checkpoint.
+
+    Defaults retain the notebook behavior, including the identity-head checkpoint.
+    Uses the same raw definition inputs as training and checkpoint evaluation.
+    """
     if embed_name == 'SBERT_mpnet':
         base_model = 'sentence-transformers/paraphrase-multilingual-mpnet-base-v2'
     elif embed_name == 'SBERT_LaBSE':
@@ -202,44 +209,18 @@ def dump_vanilla_embeddings(trainer, slang_inds, fold_name, embed_name='SBERT_mp
     else:
         raise ValueError(f'Unknown embed_name: {embed_name}')
 
-    enc = SBertEncoder(base_model)
+    enc = encoder if encoder is not None else SBertEncoder(base_model)
 
-    ds = trainer.dataset
-
-    def collect_slang_sents(ind):
-        sentences = []
-        for i in ind:
-            text = ds.slang_data[i].def_sent
-            if contains_english(text):
-                sentences.append(' '.join(simple_preprocess(text)))
-            else:
-                sentences.append(text)
-        return sentences
-
-    train_sents = collect_slang_sents(slang_inds.train)
-    dev_sents   = collect_slang_sents(slang_inds.dev)
-    test_sents  = collect_slang_sents(slang_inds.test)
-
-    std_sents = []
-    for i in range(ds.V):
-        w = ds.vocab[i]
-        for d in ds.conv_data[w].definitions:
-            text = d['def']
-            if contains_english(text):
-                std_sents.append(' '.join(simple_preprocess(text)))
-            else:
-                std_sents.append(text)
-
-    train_emb = enc.encode_sentences(train_sents)
-    dev_emb   = enc.encode_sentences(dev_sents)
-    test_emb  = enc.encode_sentences(test_sents)
-    std_emb   = enc.encode_sentences(std_sents)
+    embeds = enc.encode_dataset(trainer.dataset, slang_inds)
 
     out_dir = os.path.join(trainer.out_dir, fold_name)
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f'sum_embed_{embed_name}_with_head.npz')
-    np.savez(out_path, train=train_emb, dev=dev_emb, test=test_emb, standard=std_emb)
+    np.savez(out_path, **embeds)
     print(f'[Vanilla baseline saved] {out_path}')
+
+    if not save_checkpoint:
+        return out_path
 
     # Also save a compatible .pt checkpoint with an identity head so that
     # it can be loaded by SBertWithHeadEncoder for reproducibility.
@@ -270,3 +251,4 @@ def dump_vanilla_embeddings(trainer, slang_inds, fold_name, embed_name='SBERT_mp
     pt_path = os.path.join(sb_dir, f'{embed_name}_with_head.pt')
     torch.save(ckpt, pt_path)
     print(f'[Vanilla checkpoint saved] {pt_path}')
+    return out_path

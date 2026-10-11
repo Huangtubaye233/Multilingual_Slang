@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# Conda activation hooks can reference unset variables.
+set -eo pipefail
 
 # Usage:
-#   bash recreate_slanggen_env.sh
-#   bash recreate_slanggen_env.sh myenv
-#   FORCE_RECREATE=1 bash recreate_slanggen_env.sh
+#   bash create_slanggen_env.sh
+#   bash create_slanggen_env.sh myenv
+#   FORCE_RECREATE=1 bash create_slanggen_env.sh
 
 ENV_NAME="${1:-slanggen}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -15,8 +16,16 @@ if [[ ! -f "${ENV_FILE}" ]]; then
   exit 1
 fi
 
-# Prefer user-provided conda root;
-CONDA_ROOT=""
+# Prefer a user-provided root; otherwise discover the installed Conda.
+if [[ -z "${CONDA_ROOT:-}" ]]; then
+  if ! command -v conda >/dev/null 2>&1; then
+    echo "Conda not found. Set CONDA_ROOT to your Conda installation directory." >&2
+    exit 1
+  fi
+  CONDA_ROOT="$(conda info --base)"
+fi
+# Conda on Windows reports backslashes; Bash accepts the forward-slash form.
+CONDA_ROOT="${CONDA_ROOT//\\//}"
 CONDA_SH="${CONDA_ROOT}/etc/profile.d/conda.sh"
 
 if [[ ! -f "${CONDA_SH}" ]]; then
@@ -41,15 +50,14 @@ echo "Creating env ${ENV_NAME} from ${ENV_FILE}"
 conda env create -n "${ENV_NAME}" -f "${ENV_FILE}"
 
 conda activate "${ENV_NAME}"
+python -m nltk.downloader -q stopwords
+python -m pip check
 python - <<'PY'
 import sys
+import torch
 print("Python:", sys.version.split()[0])
-try:
-    import torch
-    print("Torch:", torch.__version__)
-    print("CUDA available:", torch.cuda.is_available())
-except Exception as exc:
-    print("Torch check failed:", exc)
+print("Torch:", torch.__version__)
+print("CUDA available:", torch.cuda.is_available())
 PY
 
 echo "Done. Activate with: conda activate ${ENV_NAME}"

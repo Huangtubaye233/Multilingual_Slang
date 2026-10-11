@@ -8,6 +8,9 @@ __pycache__/
 !.env.example
 
 # Downloaded model caches and local migration backups
+/models/
+/archive
+/Overlap_Analysis/
 /models--*/
 /.locks/
 /CACHEDIR.TAG
@@ -32,3 +35,19 @@ slanggen/Demo/.ipynb_checkpoints/
 slanggen/Demo/CatGO/
 slanggen/Demo/Results/
 slanggen/Demo/slanggen/
+/.paraphrase_progress/
+Data_Collection/*_paraphrased.*.tmp
+
+/Data_Collection/English.csv
+/Data_Collection/Chinese.csv
+/Data_Collection/Russian.csv
+/Data_Collection/English_paraphrased.csv
+/Data_Collection/Chinese_paraphrased.csv
+/Data_Collection/Russian_paraphrased.csv
+/Data_Collection/Russian/structured_russian_dataset.csv
+
+# Generated inputs contain full dataset definitions.
+/slanggen/Demo/size_matched_indices*/
+slanggen/Demo/representational_results/
+slanggen/Demo/human_machine_text_control/results/
+slanggen/Demo/human_machine_text_control/.build-*/
